@@ -41,6 +41,8 @@ not live machine data; the captures execute no real system actions.
 | File-vault interior | SSH link transition |
 | ![Isolated amber file vault](docs/screenshots/vault.png) | ![Cyan SSH tunnel awaiting a remote snapshot](docs/screenshots/ssh-transit.png) |
 
+![Hunt fixture with red rogue processes and PID/range locators](docs/screenshots/hunt.png)
+
 ![Signal acknowledgement pulse and returned daemon-result panel, using an offline fixture](docs/screenshots/signal-confirmed.png)
 
 ## Layout
@@ -106,6 +108,19 @@ not evidence that a syscall did or did not occur. No visual effect executes an
 action on its own, and a pending shot cannot be redirected by travel or a second
 shot. Armed local smite still uses the Oracle; remote smite still targets the
 acknowledged remote host.
+
+### Hunt visibility
+
+Hunt targets render as pulsing red process towers on the CPU plains, with
+readable `ROGUE / PID` labels. Screen-space brackets show their PID and range;
+edge arrows marked `BEHIND` keep off-screen rogues findable without selecting or
+firing at them. Local and remote hunt markers use their own PID namespaces and
+do not leak into file vaults. Target lock and signals remain deliberate player
+actions: aim, left-click to lock, then F/C/K.
+
+Enemy IDs are normalized once after JSON parsing so Godot's float-valued JSON
+numbers match integer process identities. Spawn behavior and daemon safety
+rules are unchanged; these are rendering/recognition changes, not fake enemies.
 
 ### Safe visual verification
 

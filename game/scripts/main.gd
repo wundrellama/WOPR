@@ -77,6 +77,7 @@ var sim_playing := false           # mirrored from world["sim"]["playing"]
 var sim_info := {}                 # full sim state for the HUD
 var daemon_pid := -1               # daemon we spawned ourselves (-1 = adopted)
 var rogue_tags: Dictionary = {}    # pid -> Label3D floating over a ROGUE
+var local_rogues: Dictionary = {}   # canonical integer PIDs, never raw JSON membership
 var roads: Dictionary = {}         # ip -> {start, end, mat, packets}
 var kernel_ring_rot := 0.0
 var water_y := 6.0
@@ -446,6 +447,11 @@ func _on_world(_result: int, code: int, _headers: PackedStringArray, body: Packe
 	if typeof(parsed) != TYPE_DICTIONARY or not parsed.has("procs"):
 		return
 	world = parsed
+	# Godot JSON numbers are floats. Array membership is type-sensitive, so
+	# normalize enemy identity once at the transport boundary, as remote does.
+	local_rogues.clear()
+	for enemy_pid in world.get("enemies", []):
+		local_rogues[int(enemy_pid)] = true
 	# mirror sim state
 	var sim: Dictionary = world.get("sim", {})
 	sim_info = sim
@@ -707,7 +713,7 @@ func _district_pos(p: Dictionary) -> Vector3:
 	var pid: int = p["pid"]
 	var h1 := (pid * 2654435761) % 4093
 	var h2 := (pid * 40503) % 4099
-	if pid in world.get("enemies", []):
+	if local_rogues.has(pid):
 		# rogues roam the CPU plains: hash anchor + slow lissajous drift per tick
 		var t := float(world.get("tick", 0))
 		var ph := float(h1 % 628) / 100.0
@@ -776,12 +782,12 @@ func _sync_procs() -> void:
 				base = Color(1.0, 0.85, 0.2)  # locked target = gold
 			Art.update_material(mat2, base, 0.2 + cpu)
 		# ROGUEs get a floating tag so they can't hide in the crowd
-		if pid in world.get("enemies", []):
+		if local_rogues.has(pid):
 			if not rogue_tags.has(pid):
 				var tag := Label3D.new()
-				tag.text = "▼ ROGUE ▼"
+				tag.text = "▼ ROGUE / PID %d ▼" % pid
 				tag.font_size = 64
-				tag.pixel_size = 0.02
+				tag.pixel_size = 0.16
 				tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 				tag.outline_size = 8
 				tag.outline_modulate = Color(0, 0, 0, 0.9)
@@ -810,9 +816,9 @@ func _sync_procs() -> void:
 
 ## Species taxonomy — what KIND of creature this monolith is.
 ## Kernel spirits are born of kthreadd (pid 2).
-func _species(p: Dictionary) -> Dictionary:
+func _species(p: Dictionary, local_namespace: bool = true) -> Dictionary:
 	var pid: int = p["pid"]
-	if pid in world.get("enemies", []):
+	if local_namespace and local_rogues.has(pid):
 		return {"name": "ROGUE", "color": Color(1.0, 0.1, 0.1)}
 	if bool(p.get("hydra", false)):
 		return {"name": "Hydra", "color": Color(0.9, 0.75, 0.1)}
@@ -930,6 +936,18 @@ func _unhandled_input(event: InputEvent) -> void:
 					"hunting LOCAL + REMOTE — rogues on every open host"][lvl]
 
 
+func _hunt_targets() -> Dictionary:
+	var result := {}
+	if mode == "vault":
+		return result
+	var known: Dictionary = remote_rogues if mode == "remote" else local_rogues
+	var bodies: Dictionary = remote_monoliths if mode == "remote" else monoliths
+	for pid in known:
+		if bodies.has(pid) and is_instance_valid(bodies[pid]):
+			result[pid] = bodies[pid]
+	return result
+
+
 func _process(delta: float) -> void:
 	_advance_travel(delta)
 	if actions_need_release and not _action_key_held():
@@ -950,6 +968,7 @@ func _process(delta: float) -> void:
 	hover_label.position = Vector2(64, viewport_size.y * 0.68)
 	hover_label.size.x = viewport_size.x - 128.0
 	crosshair.target = remote_monoliths.get(selected_pid) if mode == "remote" else monoliths.get(selected_pid)
+	crosshair.hunt_targets = _hunt_targets()
 	if travel_state != "idle" or actions_need_release or arm_screen != null or splash != null or farewell != null:
 		erase_hold_start = -1.0
 	elif mode == "vault":
@@ -1436,9 +1455,9 @@ func _render_remote(parsed: Dictionary) -> void:
 		remote_monoliths[pid] = body
 		if remote_rogues.has(pid):
 			var tag := Label3D.new()
-			tag.text = "▼ ROGUE @ %s ▼" % remote_host
+			tag.text = "▼ ROGUE / PID %d @ %s ▼" % [pid, remote_host]
 			tag.font_size = 64
-			tag.pixel_size = 0.02
+			tag.pixel_size = 0.16
 			tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 			tag.outline_size = 8
 			tag.outline_modulate = Color(0, 0, 0, 0.9)
@@ -1481,7 +1500,7 @@ func _update_remote_hover() -> void:
 		hover_label.text = "REMOTE: %s — F/C/K act on this machine · Esc: return home" % remote_host
 		return
 	hover_label.add_theme_color_override("font_color", Color(0.4, 1.0, 0.7))
-	var what: String = "ROGUE" if remote_rogues.has(int(p["pid"])) else str(_species(p)["name"])
+	var what: String = "ROGUE" if remote_rogues.has(int(p["pid"])) else str(_species(p, false)["name"])
 	hover_label.text = "%s @ %s  ·  pid %d '%s'  ·  %s  ·  cpu %s%%  ·  %dMB  ·  %s" % [
 		what, remote_host, p["pid"], p["name"], p["state"],
 		p["cpu"], int(float(p["mem_rss"]) / 1048576.0), p["user"]]

@@ -53,6 +53,8 @@ func _run() -> void:
 	var game := VisualWorld.new()
 	root.add_child(game)
 	var data := _fixture()
+	if view in ["hunt", "hunt-behind"]:
+		data.enemies = [120, 121, 122]
 	if snapshot != "":
 		data = JSON.parse_string(FileAccess.get_file_as_string(snapshot))
 		assert(data.has("procs"), "Invalid read-only snapshot")
@@ -60,7 +62,10 @@ func _run() -> void:
 		game._start_game()
 		game._on_world(0, 200, PackedStringArray(), JSON.stringify(data).to_utf8_buffer())
 		game.poll_timer.stop()
-		if view == "target":
+		if view == "hunt-behind":
+			game.camera.rotate_y(PI)
+			game.yaw = game.camera.rotation.y
+		elif view == "target":
 			game.selected_pid = 120
 		elif view == "sim":
 			game.sim_playing = true
