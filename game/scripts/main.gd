@@ -268,7 +268,6 @@ func _build_arm_screen() -> void:
 	s.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	vb.add_child(s)
 	arm_field = LineEdit.new()
-	arm_field.secret_character_modulation = Color(1, 1, 1)
 	arm_field.secret_character = "•"
 	arm_field.placeholder_text = "incantation"
 	arm_field.custom_minimum_size = Vector2(420, 44)
