@@ -41,9 +41,14 @@ ruin — is the entire point of the game.
 ## Run it
 
 ```sh
-python3 telemetry/frameshiftd.py        # terminal 1
-godot --path game/                      # terminal 2
+godot --path game/                      # that's it
 ```
+
+The game adopts a running `frameshiftd` if one answers on `127.0.0.1:8765`,
+otherwise it spawns its own as a child with a parent-death watchdog. Either
+way, **quitting the game stops everything** — recording, enemies, the Oracle.
+To run the daemon separately (e.g. for remote-host enemy hunting before you
+launch the game): `python3 telemetry/frameshiftd.py`.
 
 ## Controls
 
