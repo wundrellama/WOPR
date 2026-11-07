@@ -29,10 +29,12 @@ World schema (v0):
 """
 import json
 import os
+import shutil
 import socket
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -177,6 +179,58 @@ def gather_hardware():
     return {"mounts": mounts, "gpu_busy": gpu_busy, "temps": temps}
 
 
+def gather_listing(path: str) -> dict:
+    """Directory contents for vault interiors. Dir sizes use a capped walk."""
+    path = os.path.realpath(path)
+    budget = [20000]
+
+    def dir_size(d: str) -> int:
+        total = 0
+        for root, _dirs, files in os.walk(d):
+            for f in files:
+                if budget[0] <= 0:
+                    return total
+                budget[0] -= 1
+                try:
+                    total += os.lstat(os.path.join(root, f)).st_size
+                except OSError:
+                    pass
+        return total
+
+    entries = []
+    with os.scandir(path) as it:
+        for e in it:
+            try:
+                is_dir = e.is_dir(follow_symlinks=False)
+                st = e.stat(follow_symlinks=False)
+                entries.append({
+                    "name": e.name, "dir": is_dir,
+                    "size": dir_size(e.path) if is_dir else st.st_size,
+                    "mtime": st.st_mtime,
+                })
+            except OSError:
+                continue
+    entries.sort(key=lambda x: (not x["dir"], -x["size"]))
+    return {
+        "path": path,
+        "parent": os.path.dirname(path) or "/",
+        "entries": entries[:400],
+        "truncated": len(entries) > 400,
+    }
+
+
+def protected_paths() -> set:
+    """Paths the rm verb will never touch, even in Tier 2."""
+    home = os.path.expanduser("~")
+    s = {"/", "/home", home, os.path.expanduser("~/.hermes")}
+    try:
+        for part in psutil.disk_partitions(all=False):
+            s.add(os.path.realpath(part.mountpoint))
+    except Exception:
+        pass
+    return s
+
+
 def gather_world(tick: int) -> dict:
     vm = psutil.virtual_memory()
     sw = psutil.swap_memory()
@@ -254,13 +308,11 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length", 0))
             req = json.loads(self.rfile.read(n))
-            verb, pid, sig = req.get("verb"), int(req.get("pid", -1)), int(req.get("sig", 0))
-            if verb != "kill" or sig not in (19, 18, 9):
-                raise ValueError("verb must be 'kill', sig must be 19/18/9")
-            if pid in self._protected():
-                raise ValueError(f"pid {pid} is protected")
-            os.kill(pid, sig)
-            body = json.dumps({"ok": True, "syscall": f"kill({pid}, {sig})"}).encode()
+            verb = req.get("verb")
+            if verb == "rm":
+                body = self._do_rm(req)
+            else:
+                body = self._do_kill(req)
         except Exception as e:
             body = json.dumps({"ok": False, "error": str(e)}).encode()
         self.send_response(200)
@@ -269,8 +321,58 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    @staticmethod
+    def _do_kill(req: dict) -> bytes:
+        pid, sig = int(req.get("pid", -1)), int(req.get("sig", 0))
+        if req.get("verb") != "kill" or sig not in (19, 18, 9):
+            raise ValueError("verb must be 'kill', sig must be 19/18/9")
+        if pid in _Handler._protected():
+            raise ValueError(f"pid {pid} is protected")
+        os.kill(pid, sig)
+        return json.dumps({"ok": True, "syscall": f"kill({pid}, {sig})"}).encode()
+
+    @staticmethod
+    def _do_rm(req: dict) -> bytes:
+        # Tier-2 file verb: real rm -rf, but guarded. Requires explicit
+        # confirm flag (the game's hold-to-erase gesture sets it), refuses
+        # protected paths, and refuses anything not writable by this user.
+        if not req.get("confirm"):
+            raise ValueError("rm requires confirm=true (hold the erase key)")
+        raw = str(req.get("path", ""))
+        path = os.path.realpath(os.path.expanduser(raw))
+        if not os.path.exists(path) and not os.path.islink(path):
+            raise ValueError(f"no such path: {path}")
+        if path in protected_paths():
+            raise ValueError(f"{path} is protected")
+        # never climb above a mount root into protected territory
+        for prot in protected_paths():
+            if path == prot or path.startswith(prot.rstrip("/") + "/"):
+                if path == prot:
+                    raise ValueError(f"{path} is protected")
+        if not os.access(path, os.W_OK):
+            raise ValueError(f"not writable by this user: {path}")
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+            verb_txt = f"rm -rf {path}"
+        else:
+            os.unlink(path)
+            verb_txt = f"rm {path}"
+        return json.dumps({"ok": True, "syscall": verb_txt, "path": path}).encode()
+
     def do_GET(self):
-        if self.path in ("/world.json", "/health"):
+        if self.path.startswith("/list"):
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                path = qs.get("path", [os.path.expanduser("~")])[0]
+                body = json.dumps(gather_listing(path)).encode()
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path in ("/world.json", "/health"):
             body = self.blob if self.blob else b'{"error":"no snapshot yet"}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

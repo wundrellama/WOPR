@@ -39,6 +39,18 @@ var water: MeshInstance3D
 var forge_body: StaticBody3D = null
 var tower_bodies: Dictionary = {}  # ip -> StaticBody3D
 
+# --- vault interiors ---
+var world_root: Node3D
+var vault_root: Node3D
+var list_http: HTTPRequest
+var mode := "world"            # "world" | "vault"
+var vault_path := ""
+var vault_parent := ""
+var vault_bodies: Dictionary = {}  # StaticBody3D -> entry dict
+var erase_hold_start := -1.0       # msec when X was pressed, -1 = not held
+var hover_mount_path := ""         # vault path under crosshair in world mode
+const ERASE_HOLD_MS := 1000.0
+
 func _ready() -> void:
 	world_http = HTTPRequest.new()
 	add_child(world_http)
@@ -46,6 +58,14 @@ func _ready() -> void:
 	action_http = HTTPRequest.new()
 	add_child(action_http)
 	action_http.request_completed.connect(_on_action)
+	list_http = HTTPRequest.new()
+	add_child(list_http)
+	list_http.request_completed.connect(_on_listing)
+	world_root = Node3D.new()
+	add_child(world_root)
+	vault_root = Node3D.new()
+	vault_root.visible = false
+	add_child(vault_root)
 	poll_timer = Timer.new()
 	poll_timer.wait_time = 1.0
 	add_child(poll_timer)
@@ -162,7 +182,7 @@ func _add_box(pos: Vector3, size: Vector3, color: Color, info: Dictionary) -> St
 	cs.shape = shape
 	body.add_child(cs)
 	body.position = pos
-	add_child(body)
+	world_root.add_child(body)
 	pickables[body] = info
 	return body
 
@@ -177,7 +197,7 @@ func _add_label(text: String, pos: Vector3, color: Color) -> void:
 	l.outline_modulate = Color(0, 0, 0, 0.8)
 	l.modulate = color
 	l.position = pos
-	add_child(l)
+	world_root.add_child(l)
 
 
 func _build_geography() -> void:
@@ -273,7 +293,7 @@ func _update_geo() -> void:
 			var mid := Vector3(pos.x / 2.0, 2.0, pos.z / 2.0)
 			road.position = mid
 			road.scale = Vector3(1.5, 1.5, maxf(mid.length() * 2.0, 1.0))
-			add_child(road)
+			world_root.add_child(road)
 			road.look_at(Vector3(pos.x, 2.0, pos.z))
 		var tmat: StandardMaterial3D = body.get_child(0).material_override
 		tmat.emission = Color(0.2, 0.9, 0.8) * (0.2 + clampf(float(r["count"]) / 20.0, 0.0, 0.8))
@@ -334,7 +354,7 @@ func _sync_procs() -> void:
 			shape.size = Vector3.ONE
 			cs.shape = shape
 			body.add_child(cs)
-			add_child(body)
+			world_root.add_child(body)
 			monoliths[pid] = body
 			pickables[body] = {"kind": "proc", "pid": pid}
 			bob_phase[pid] = randf() * TAU
@@ -403,13 +423,29 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed:
 		match event.keycode:
 			KEY_ESCAPE:
-				get_tree().quit()
+				if mode == "vault":
+					_vault_leave()
+				else:
+					get_tree().quit()
+			KEY_ENTER, KEY_KP_ENTER:
+				if mode == "vault":
+					_vault_open_hovered()
+				elif hover_mount_path != "":
+					_enter_vault(hover_mount_path)
+			KEY_BACKSPACE:
+				if mode == "vault":
+					if vault_parent != "" and vault_parent != vault_path:
+						_enter_vault(vault_parent)
+					else:
+						_vault_leave()
 			KEY_F:
-				_act(19)   # SIGSTOP
+				if mode == "world":
+					_act(19)   # SIGSTOP
 			KEY_C:
-				_act(18)   # SIGCONT
+				if mode == "world":
+					_act(18)   # SIGCONT
 			KEY_K:
-				if event.shift_pressed:
+				if mode == "world" and event.shift_pressed:
 					_act(9)  # SIGKILL
 
 
@@ -427,7 +463,19 @@ func _process(delta: float) -> void:
 	camera.global_position += dir.normalized() * speed * delta
 	crosshair.position = get_viewport().get_visible_rect().size / 2.0 - Vector2(6, 14)
 	hover_label.position = Vector2(0, get_viewport().get_visible_rect().size.y * 0.72)
-	_update_hover()
+	if mode == "vault":
+		_vault_hover_text()
+		# hold-to-erase gesture: X held for ERASE_HOLD_MS fires real rm
+		if Input.is_key_pressed(KEY_X):
+			if erase_hold_start < 0.0:
+				erase_hold_start = Time.get_ticks_msec()
+			elif Time.get_ticks_msec() - erase_hold_start >= ERASE_HOLD_MS:
+				erase_hold_start = -1.0
+				_vault_erase()
+		else:
+			erase_hold_start = -1.0
+	else:
+		_update_hover()
 	# living world breathes; frozen ones don't
 	for pid in monoliths:
 		var body3d: StaticBody3D = monoliths[pid]
@@ -459,6 +507,7 @@ func _hover_ray() -> Dictionary:
 
 func _update_hover() -> void:
 	hover_pid = -1
+	hover_mount_path = ""
 	var hit := _hover_ray()
 	if hit.is_empty():
 		hover_label.text = ""
@@ -491,8 +540,9 @@ func _update_hover() -> void:
 			hover_label.text = "REMOTE CITY %s  ·  %d live bridges" % [r["ip"], r["count"]]
 		"mount":
 			var mnt: Dictionary = info["mnt"]
+			hover_mount_path = str(mnt["path"])
 			hover_label.add_theme_color_override("font_color", Color(0.95, 0.75, 0.4))
-			hover_label.text = "VAULT %s  ·  %s  ·  %d%% full  ·  %d GB" % [
+			hover_label.text = "VAULT %s  ·  %s  ·  %d%% full  ·  %d GB  ·  Enter: descend" % [
 				mnt["path"], mnt["fstype"], int(mnt["percent"]),
 				int(float(mnt["total"]) / 1073741824.0)]
 		"forge":
@@ -507,8 +557,164 @@ func _pick() -> void:
 	if Input.get_mouse_mode() != Input.MOUSE_MODE_CAPTURED:
 		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 		return
+	if mode == "vault":
+		return  # Enter/Backspace drive navigation inside
 	if hover_pid >= 0:
 		selected_pid = hover_pid
+
+
+# ---------------------------------------------------------------- vaults
+
+func _enter_vault(path: String) -> void:
+	list_http.request(API + "/list?path=" + path.uri_encode())
+
+
+func _on_listing(_result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	var parsed = JSON.parse_string(body.get_string_from_utf8())
+	if typeof(parsed) != TYPE_DICTIONARY or not parsed.has("entries"):
+		last_action = "vault refused: " + str(parsed)
+		return
+	mode = "vault"
+	world_root.visible = false
+	vault_root.visible = true
+	vault_path = parsed["path"]
+	vault_parent = parsed["parent"]
+	_render_vault(parsed["entries"], parsed.get("truncated", false))
+	# park the camera above the hall looking down its length
+	camera.position = Vector3(0, 60, 220)
+	yaw = 0.0
+	pitch = -0.35
+	camera.rotation = Vector3(pitch, yaw, 0)
+	last_action = "entered " + vault_path
+
+
+func _fmt_size(b: int) -> String:
+	var f := float(b)
+	for unit in ["B", "KB", "MB", "GB", "TB"]:
+		if f < 1024.0:
+			return "%.1f %s" % [f, unit]
+		f /= 1024.0
+	return "%.1f PB" % f
+
+
+func _render_vault(entries: Array, truncated: bool) -> void:
+	for c in vault_root.get_children():
+		c.queue_free()
+	vault_bodies.clear()
+	# hall floor
+	var fm := MeshInstance3D.new()
+	var pm := PlaneMesh.new()
+	pm.size = Vector2(1200, 1200)
+	var fmat := StandardMaterial3D.new()
+	fmat.albedo_color = Color(0.06, 0.05, 0.03)
+	fmat.emission_enabled = true
+	fmat.emission = Color(0.03, 0.02, 0.01)
+	fm.material_override = fmat
+	fm.mesh = pm
+	vault_root.add_child(fm)
+	var title := Label3D.new()
+	title.text = "%s   (%d entries%s)" % [vault_path, entries.size(),
+		", truncated" if truncated else ""]
+	title.font_size = 96
+	title.pixel_size = 0.02
+	title.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	title.modulate = Color(0.95, 0.75, 0.4)
+	title.position = Vector3(0, 70, -160)
+	vault_root.add_child(title)
+	# grid of file/dir monoliths, dirs gold, files amber; size = bytes
+	var n := entries.size()
+	var cols := ceili(sqrt(float(maxi(n, 1))))
+	for i in n:
+		var e: Dictionary = entries[i]
+		var sz: float = float(e["size"])
+		var h: float = clampf(2.0 + log(maxf(sz, 1.0)) * 4.0, 2.0, 120.0)
+		var row := i / cols
+		var col := i % cols
+		var x := (float(col) - float(cols) / 2.0) * 26.0
+		var z := (float(row) - float(cols) / 2.0) * 26.0
+		var is_dir: bool = e["dir"]
+		var color: Color = Color(1.0, 0.8, 0.3) if is_dir else Color(0.85, 0.55, 0.3)
+		var body := StaticBody3D.new()
+		var m := MeshInstance3D.new()
+		var bm := BoxMesh.new()
+		bm.size = Vector3.ONE
+		m.mesh = bm
+		var mat := StandardMaterial3D.new()
+		mat.emission_enabled = true
+		mat.albedo_color = color
+		mat.emission = color * 0.35
+		m.material_override = mat
+		body.add_child(m)
+		var cs := CollisionShape3D.new()
+		var shape := BoxShape3D.new()
+		cs.shape = shape
+		body.add_child(cs)
+		body.position = Vector3(x, h / 2.0, z)
+		m.scale = Vector3(10, h, 10)
+		shape.size = Vector3(10, h, 10)
+		vault_root.add_child(body)
+		vault_bodies[body] = e
+
+
+func _vault_hover() -> Dictionary:
+	var space := camera.get_world_3d().direct_space_state
+	var query := PhysicsRayQueryParameters3D.create(
+		camera.global_position,
+		camera.global_position + camera.global_transform.basis.z * -1500.0)
+	var hit := space.intersect_ray(query)
+	if hit.is_empty() or not hit.has("collider"):
+		return {}
+	if vault_bodies.has(hit["collider"]):
+		return {"body": hit["collider"], "entry": vault_bodies[hit["collider"]]}
+	return {}
+
+
+func _vault_hover_text() -> void:
+	var hit := _vault_hover()
+	if hit.is_empty():
+		hover_label.text = "VAULT %s — Enter: descend into dir · Backspace: leave · hold X: erase" % vault_path
+		return
+	var e: Dictionary = hit["entry"]
+	var full := vault_path.rstrip("/") + "/" + str(e["name"])
+	hover_label.add_theme_color_override("font_color",
+		Color(1.0, 0.85, 0.4) if e["dir"] else Color(0.9, 0.65, 0.4))
+	var kind := "DIR" if e["dir"] else "FILE"
+	hover_label.text = "%s  '%s'  ·  %s  ·  %s\nEnter: open · hold X: ERASE (real rm)" % [
+		kind, e["name"], _fmt_size(int(e["size"])),
+		Time.get_datetime_string_from_unix_time(int(e["mtime"]))]
+
+
+func _vault_open_hovered() -> void:
+	var hit := _vault_hover()
+	if hit.is_empty():
+		return
+	var e: Dictionary = hit["entry"]
+	if e["dir"]:
+		_enter_vault(vault_path.rstrip("/") + "/" + str(e["name"]))
+
+
+func _vault_leave() -> void:
+	mode = "world"
+	world_root.visible = true
+	vault_root.visible = false
+	vault_bodies.clear()
+	camera.position = Vector3(0, 120, 520)
+	yaw = 0.0
+	pitch = -0.35
+	camera.rotation = Vector3(pitch, yaw, 0)
+	last_action = "left vault"
+
+
+func _vault_erase() -> void:
+	var hit := _vault_hover()
+	if hit.is_empty():
+		last_action = "nothing to erase under crosshair"
+		return
+	var e: Dictionary = hit["entry"]
+	var full := vault_path.rstrip("/") + "/" + str(e["name"])
+	var body := JSON.stringify({"verb": "rm", "path": full, "confirm": true})
+	action_http.request(API + "/action", [], HTTPClient.METHOD_POST, body)
+	last_action = "erasing %s..." % full
 
 
 func _act(sig: int) -> void:
