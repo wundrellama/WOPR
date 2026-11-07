@@ -64,7 +64,7 @@ def gather_processes():
     for p in psutil.process_iter(
         ["pid", "name", "username", "status", "ppid", "cpu_percent",
          "memory_info", "memory_percent", "num_threads", "create_time",
-         "cmdline"]
+         "cmdline", "cpu_num"]
     ):
         try:
             infos.append(p.info)
@@ -89,6 +89,7 @@ def gather_processes():
             "threads": info.get("num_threads") or 0,
             "children": len(children_of.get(pid, [])),
             "age": round(now - ct, 1),
+            "cpu_num": info.get("cpu_num", -1) if info.get("cpu_num", -1) is not None else -1,
             "cmdline": " ".join(info.get("cmdline") or [])[:200],
         })
     return procs
@@ -139,6 +140,43 @@ def gather_disk():
     }
 
 
+def gather_hardware():
+    """Mounts, GPU busy%, temperatures — the physical geography."""
+    mounts = []
+    seen = set()
+    for part in psutil.disk_partitions(all=False):
+        if part.mountpoint in seen:
+            continue
+        seen.add(part.mountpoint)
+        try:
+            du = psutil.disk_usage(part.mountpoint)
+            pct = du.percent
+        except OSError:
+            pct = 0
+        mounts.append({
+            "path": part.mountpoint, "fstype": part.fstype,
+            "total": du.total if pct else 0, "percent": pct,
+        })
+    gpu_busy = -1
+    try:  # amdgpu / nvidia expose a sysfs busy percent (card index varies)
+        import glob
+        for cand in sorted(glob.glob("/sys/class/drm/card*/device/gpu_busy_percent")):
+            with open(cand) as f:
+                gpu_busy = int(f.read().strip())
+            break
+    except (OSError, ValueError):
+        pass
+    temps = {}
+    try:
+        st = psutil.sensors_temperatures()
+        for label, entries in (st or {}).items():
+            if entries:
+                temps[label] = round(entries[0].current, 1)
+    except Exception:
+        pass
+    return {"mounts": mounts, "gpu_busy": gpu_busy, "temps": temps}
+
+
 def gather_world(tick: int) -> dict:
     vm = psutil.virtual_memory()
     sw = psutil.swap_memory()
@@ -182,6 +220,7 @@ def gather_world(tick: int) -> dict:
             "percent": vm.percent,
         },
         "disk": gather_disk(),
+        "hw": gather_hardware(),
         "procs": gather_processes(),
         "net": gather_net(),
     }
