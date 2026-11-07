@@ -9,7 +9,7 @@ extends Node3D
 ##   GPU FORGE     — one great furnace, glow = GPU busy%
 ##   THE TIDE      — memory pressure is a literal water level over the plain
 ##
-## F freezes (SIGSTOP), C resumes (SIGCONT), Shift+K smites (SIGKILL).
+## F freezes (SIGSTOP), C resumes (SIGCONT), K smites (SIGKILL).
 ## These are real syscalls against real PIDs.
 
 const API := "http://127.0.0.1:8765"
@@ -714,18 +714,14 @@ func _unhandled_input(event: InputEvent) -> void:
 				if mode != "vault":
 					_act(18)   # SIGCONT
 			KEY_K:
-				if mode != "vault" and event.shift_pressed:
+				if mode != "vault":
 					_act(9)  # SIGKILL
 			KEY_V:
 				if mode == "remote" and remote_host != "":
 					_enter_vault("~", remote_host)
 			KEY_H:
-				# direct toggles, no cycling: H = local on/off, Shift+H = +remote
-				var lvl: int = int(world.get("enemies_level", 0))
-				if event.shift_pressed:
-					lvl = 0 if lvl == 2 else 2
-				else:
-					lvl = 0 if lvl >= 1 else 1
+				# one key cycles: off -> local -> local+remote -> off
+				var lvl: int = (int(world.get("enemies_level", 0)) + 1) % 3
 				action_http.request(API + "/action", [], HTTPClient.METHOD_POST,
 					JSON.stringify({"verb": "enemies", "level": lvl}))
 				last_action = ["hunting OFF — rogues purged",
@@ -1030,7 +1026,7 @@ func _update_remote_hover() -> void:
 		camera.global_position + camera.global_transform.basis.z * -1500.0)
 	var hit := space.intersect_ray(query)
 	if hit.is_empty() or not hit.has("collider"):
-		hover_label.text = "REMOTE: %s — F/C/Shift+K act on this machine · Esc: return home" % remote_host
+		hover_label.text = "REMOTE: %s — F/C/K act on this machine · Esc: return home" % remote_host
 		return
 	for pid in remote_monoliths:
 		if remote_monoliths[pid] == hit["collider"]:
@@ -1040,7 +1036,7 @@ func _update_remote_hover() -> void:
 	if hover_pid >= 0:
 		p = _remote_proc(hover_pid)
 	if p == null:
-		hover_label.text = "REMOTE: %s — F/C/Shift+K act on this machine · Esc: return home" % remote_host
+		hover_label.text = "REMOTE: %s — F/C/K act on this machine · Esc: return home" % remote_host
 		return
 	hover_label.add_theme_color_override("font_color", Color(0.4, 1.0, 0.7))
 	var what: String = "ROGUE" if remote_rogues.has(int(p["pid"])) else str(_species(p)["name"])
@@ -1246,7 +1242,7 @@ func _update_hud() -> void:
 		hud.text = "waiting for frameshiftd... (python3 telemetry/frameshiftd.py)"
 		return
 	if mode == "remote":
-		hud.text = "REMOTE WORLD: %s\nF freeze · C resume · Shift+K smite — REAL remote syscalls via ssh · V: browse remote files\nEsc: return home\nlast: %s" % [remote_host, last_action]
+		hud.text = "REMOTE WORLD: %s\nF freeze · C resume · K smite — REAL remote syscalls via ssh · V: browse remote files\nEsc: return home\nlast: %s" % [remote_host, last_action]
 		return
 	var cpu: Dictionary = world["cpu"]
 	var mem: Dictionary = world["mem"]
@@ -1262,21 +1258,21 @@ func _update_hud() -> void:
 			net["conns"].size(), net["remote_hosts"].size(),
 			hw.get("mounts", []).size()],
 		"WASD move · Q/E down/up · Shift sprint · mouse look · ESC exit",
-		"F freeze (SIGSTOP) · C resume (SIGCONT) · Shift+K smite (SIGKILL) — REAL syscalls",
+		"F freeze (SIGSTOP) · C resume (SIGCONT) · K smite (SIGKILL) — REAL syscalls",
 		"purple=Kernel Spirit · green=Daemon · cyan=Your Kin · orange=User Agent · gold=Init God · grey=Frozen · pale=Ghost · yellow=Hydra",
 	]
 	var n_rogues: int = world.get("enemies", []).size()
 	var lvl: int = int(world.get("enemies_level", 0))
 	match lvl:
 		0:
-			lines.append("HUNT [H]: OFF — H: local rogues · Shift+H: local+remote")
+			lines.append("HUNT [H]: OFF — H: cycle to local rogues")
 		1:
-			lines.append("HUNT [H]: LOCAL — %d ROGUE%s here (RED, pulsing, tagged, on the CPU plains). H: off · Shift+H: +remote" % [n_rogues, "s" if n_rogues != 1 else ""])
+			lines.append("HUNT [H]: LOCAL — %d ROGUE%s here (RED, pulsing, tagged, on the CPU plains). H: off · H again: +remote" % [n_rogues, "s" if n_rogues != 1 else ""])
 		_:
 			var nrem: int = 0
 			for h in world.get("remote_enemies", {}):
 				nrem += world["remote_enemies"][h].size()
-			lines.append("HUNT [H]: LOCAL+REMOTE — %d ROGUE%s here, %d abroad (travel to hunt). H or Shift+H: off" % [n_rogues, "s" if n_rogues != 1 else "", nrem])
+			lines.append("HUNT [H]: LOCAL+REMOTE — %d ROGUE%s here, %d abroad (travel to hunt). H: off" % [n_rogues, "s" if n_rogues != 1 else "", nrem])
 	lines.append("last: " + last_action)
 	var p = null
 	if selected_pid >= 0:

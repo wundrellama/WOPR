@@ -11,7 +11,7 @@ is a real syscall. "Shall we play a game?"
 This is not a simulation and there is no sandbox. Every verb is a real syscall
 executed by a real daemon running as you:
 
-- **`Shift+K` is a real `SIGKILL`.** Aim at the wrong monolith and you kill your
+- **`K` is a real `SIGKILL`.** Aim at the wrong monolith and you kill your
   browser, your compositor, your SSH session, your work. Unsaved = gone.
 - **Hold-X in a vault is a real `rm -rf`.** The daemon guards a short list of
   protected paths (`/`, `~`, mount roots) — that is a guardrail, not a wall.
@@ -54,8 +54,8 @@ godot --path game/                      # terminal 2
 | Left-click | target | raycast |
 | `F` | freeze | `kill(pid, SIGSTOP)` — real |
 | `C` | resume | `kill(pid, SIGCONT)` — real |
-| `Shift+K` | smite | `kill(pid, SIGKILL)` — real |
-| `H` / `Shift+H` | hunt: local / +remote rogues | spawns real burner processes |
+| `K` | smite | `kill(pid, SIGKILL)` — real |
+| `H` | hunt: cycle off / local / +remote rogues | spawns real burner processes |
 | `Enter` | descend vault / travel gate | — |
 | `V` | browse remote files (in a remote world) | — |
 | Hold-`X` | erase (in a vault) | `rm -rf` — real, guarded |
@@ -84,7 +84,7 @@ strings — so the privileged surface stays one small auditable binary.
 
 The daemon spawns real CPU-burner + RAM-hoarder child processes (nice'd to
 19, TTL 180s, cap 4). They roam the plains as red ROGUE monoliths. Kill them
-with Shift+K before they expire or you "let one go free". Freezing one only
+with K before they expire or you "let one go free". Freezing one only
 buys 8 seconds — rogues break out of SIGSTOP. Because they wander among your
 real processes, an errant smite can kill something that matters. That's the
 game.
