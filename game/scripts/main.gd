@@ -706,7 +706,12 @@ func _unhandled_input(event: InputEvent) -> void:
 				if mode == "remote" and remote_host != "":
 					_enter_vault("~", remote_host)
 			KEY_H:
-				var lvl: int = (int(world.get("enemies_level", 0)) + 1) % 3
+				# direct toggles, no cycling: H = local on/off, Shift+H = +remote
+				var lvl: int = int(world.get("enemies_level", 0))
+				if event.shift_pressed:
+					lvl = 0 if lvl == 2 else 2
+				else:
+					lvl = 0 if lvl >= 1 else 1
 				action_http.request(API + "/action", [], HTTPClient.METHOD_POST,
 					JSON.stringify({"verb": "enemies", "level": lvl}))
 				last_action = ["hunting OFF — rogues purged",
@@ -1249,14 +1254,14 @@ func _update_hud() -> void:
 	var lvl: int = int(world.get("enemies_level", 0))
 	match lvl:
 		0:
-			lines.append("HUNT [H]: OFF — press H to release the rogues")
+			lines.append("HUNT [H]: OFF — H: local rogues · Shift+H: local+remote")
 		1:
-			lines.append("HUNT [H]: LOCAL — %d ROGUE%s here. RED, pulsing, tagged, roaming the CPU plains. Press H: +remote." % [n_rogues, "s" if n_rogues != 1 else ""])
+			lines.append("HUNT [H]: LOCAL — %d ROGUE%s here (RED, pulsing, tagged, on the CPU plains). H: off · Shift+H: +remote" % [n_rogues, "s" if n_rogues != 1 else ""])
 		_:
 			var nrem: int = 0
 			for h in world.get("remote_enemies", {}):
 				nrem += world["remote_enemies"][h].size()
-			lines.append("HUNT [H]: LOCAL+REMOTE — %d ROGUE%s here, %d abroad (travel to hunt). Press H: off." % [n_rogues, "s" if n_rogues != 1 else "", nrem])
+			lines.append("HUNT [H]: LOCAL+REMOTE — %d ROGUE%s here, %d abroad (travel to hunt). H or Shift+H: off" % [n_rogues, "s" if n_rogues != 1 else "", nrem])
 	lines.append("last: " + last_action)
 	var p = null
 	if selected_pid >= 0:
