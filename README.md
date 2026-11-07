@@ -1,10 +1,33 @@
 # WOPR
 
-*(formerly Frameshift)*
+*The most dangerous game.*
 
 An open world exploration game where the world is the virtual insides of the
 actual machine running the game. Every monolith is a real process. Every spell
 is a real syscall. "Shall we play a game?"
+
+## ⚠️ THIS GAME CAN DESTROY YOUR SYSTEM
+
+This is not a simulation and there is no sandbox. Every verb is a real syscall
+executed by a real daemon running as you:
+
+- **`Shift+K` is a real `SIGKILL`.** Aim at the wrong monolith and you kill your
+  browser, your compositor, your SSH session, your work. Unsaved = gone.
+- **Hold-X in a vault is a real `rm -rf`.** The daemon guards a short list of
+  protected paths (`/`, `~`, mount roots) — that is a guardrail, not a wall.
+  Anything you own and the guard list misses is destructible, permanently.
+- **The backup is not safe either.** Your btrfs snapshots live on the same disk,
+  inside the same filesystem, under paths like `@/.snapshots`. A recursive erase
+  aimed carelessly — or, in YOLO tier, deliberately — destroys the snapshots
+  *along with* the data they were supposed to rescue. There is no undo, no
+  trash, and no rollback of the rollback. If you want a real safety net, it must
+  live off this machine.
+- **SSH travel extends all of this to every host in your `~/.ssh/config`.**
+  A smite or erase abroad is a real remote `kill` / `rm -rf` on that machine.
+
+Play it on a machine you can afford to lose, or with backups you can afford to
+lose the machine for. That tension — a beautiful world you are *allowed* to
+ruin — is the entire point of the game.
 
 ## Layout
 
@@ -32,7 +55,11 @@ godot --path game/                      # terminal 2
 | `F` | freeze | `kill(pid, SIGSTOP)` — real |
 | `C` | resume | `kill(pid, SIGCONT)` — real |
 | `Shift+K` | smite | `kill(pid, SIGKILL)` — real |
-| Esc | quit | — |
+| `H` / `Shift+H` | hunt: local / +remote rogues | spawns real burner processes |
+| `Enter` | descend vault / travel gate | — |
+| `V` | browse remote files (in a remote world) | — |
+| Hold-`X` | erase (in a vault) | `rm -rf` — real, guarded |
+| `Esc` | leave vault / return home / two-stage exit | — |
 
 Yes, those are real. A Tier-2 protected set (PID 1, the daemon, its ancestors)
 is enforced daemon-side; everything else on your user account is fair game.
@@ -46,7 +73,9 @@ is enforced daemon-side; everything else on your user account is fair game.
    kill/rm via fixed verbs, remote file browsing with `V`).
 3. **YOLO** — root "Kernel Oracle" helper: `rm -rf`, `systemctl stop`,
    `rmmod`, everything. Requires sudo as the arming ritual and a btrfs
-   snapshot (`snapper create`) to exist before arming. *(planned)*
+   snapshot (`snapper create`) to exist before arming — as a *ritual*, not a
+   promise: the Oracle can erase the snapshot store too. That is intended.
+   *(planned)*
 
 The Oracle will expose **verbs, never a shell** — path arguments, not command
 strings — so the privileged surface stays one small auditable binary.

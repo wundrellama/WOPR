@@ -232,7 +232,7 @@ func _make_screen(title: String, sub: String, blink: String) -> Control:
 
 func _build_splash() -> void:
 	splash = _make_screen("W O P R",
-		"\"The only winning move is not to play.\"",
+		"\"The only winning move is not to play.\"\n\nWARNING: every spell is a real syscall.\nThis game can destroy this machine —\nincluding its snapshots.",
 		"— PRESS ENTER TO PLAY —")
 	add_child(splash)
 	splash.move_to_front()
