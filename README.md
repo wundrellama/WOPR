@@ -126,7 +126,9 @@ readable titles, arrival/return, refusal/timeout/cancellation/stale replies,
 remote path context, held-key gating, signal payloads and acknowledgements,
 root-versus-remote routing, malformed responses, surface impacts, and effect
 cleanup. Tests replace the transport boundary with offline fixture replies;
-HTTP clients must remain disconnected. The render option additionally compiles
+HTTP clients must remain disconnected. A separate startup-probe regression runs
+the production TCP probe against an ephemeral loopback listener and a refused
+endpoint, without spawning or stopping a daemon. The render option additionally compiles
 the shaders, saves both-size screen captures, and records vault/SSH/shot frame
 sequences. It does **not** exercise real signals, file deletion, SSH, or sudo.
 

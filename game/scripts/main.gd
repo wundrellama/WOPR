@@ -272,7 +272,7 @@ func _daemon_running() -> bool:
 		tcp.poll()
 		OS.delay_msec(20)
 	var up := tcp.get_status() == StreamPeerTCP.STATUS_CONNECTED
-	tcp.close()
+	tcp.disconnect_from_host()
 	return up
 
 
