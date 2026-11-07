@@ -54,6 +54,7 @@ except ImportError:
 
 PORT = int(os.environ.get("FRAMESHIFT_PORT", "8765"))
 TICK = float(os.environ.get("FRAMESHIFT_TICK", "1.0"))
+_shutdown_started = threading.Event()
 
 # --- enemies: real CPU-burner child processes the player must hunt ---
 ENEMY_CAP = int(os.environ.get("FRAMESHIFT_ENEMIES", "4"))
@@ -941,31 +942,45 @@ def main():
             pass
 
     def _bye(*_a):
+        # The game and parent watchdog can both terminate us. A second
+        # SystemExit must not interrupt an atexit cleanup waiting on SSH.
+        if _shutdown_started.is_set():
+            return
+        _shutdown_started.set()
         sys.exit(0)
     signal.signal(signal.SIGTERM, _bye)
+    signal.signal(signal.SIGINT, _bye)
 
-    if parent_pid > 0:
-        threading.Thread(target=_watch_parent, args=(parent_pid,),
-                         daemon=True).start()
-
-    threading.Thread(target=_poller, daemon=True).start()
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), _Handler)
-    print(f"frameshiftd: http://127.0.0.1:{PORT}/world.json every {TICK}s"
-          + (f" (parent {parent_pid})" if parent_pid else ""), flush=True)
+    # Register before starting workers so even an early startup failure
+    # has deterministic cleanup (Oracle first, then enemy processes).
+    atexit.register(_kill_all_enemies)
+    atexit.register(oracle_bridge.shutdown)
+    srv = None
     try:
+        if parent_pid > 0:
+            threading.Thread(target=_watch_parent, args=(parent_pid,),
+                             daemon=True).start()
+
+        threading.Thread(target=_poller, daemon=True).start()
+        srv = ThreadingHTTPServer(("127.0.0.1", PORT), _Handler)
+        print(f"frameshiftd: http://127.0.0.1:{PORT}/world.json every {TICK}s"
+              + (f" (parent {parent_pid})" if parent_pid else ""), flush=True)
         srv.serve_forever()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        srv.server_close()
+        _shutdown_started.set()
+        if srv is not None:
+            srv.server_close()
 
 
 def _watch_parent(pid: int):
-    while True:
-        time.sleep(2.0)
+    while not _shutdown_started.wait(2.0):
         try:
             os.kill(pid, 0)  # existence check, no signal delivered
         except ProcessLookupError:
+            if _shutdown_started.is_set():
+                return
             print("parent game is gone — daemon shutting down", flush=True)
             os.kill(os.getpid(), signal.SIGTERM)
             return
@@ -974,10 +989,8 @@ def _watch_parent(pid: int):
 
 
 def _poller():
-    atexit.register(_kill_all_enemies)
-    atexit.register(oracle_bridge.shutdown)
     tick = 0
-    while True:
+    while not _shutdown_started.is_set():
         t0 = time.time()
         tick += 1
         try:
@@ -996,7 +1009,7 @@ def _poller():
                     snap, separators=(",", ":")).encode()
         except Exception as e:  # keep the daemon alive on transient errors
             print(f"tick error: {e}", file=sys.stderr, flush=True)
-        time.sleep(max(TICK - (time.time() - t0), 0.05))
+        _shutdown_started.wait(max(TICK - (time.time() - t0), 0.05))
 
 
 if __name__ == "__main__":
