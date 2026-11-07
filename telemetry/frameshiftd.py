@@ -29,6 +29,8 @@ World schema (v0):
 """
 import json
 import atexit
+import collections
+import gzip
 import os
 import random
 import shutil
@@ -37,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import oracle_bridge  # noqa: E402  (Kernel Oracle client side)
@@ -397,6 +400,121 @@ def ssh_hosts() -> list:
 
 _ssh_probe_cache = {"t": 0.0, "status": {}, "refreshing": False}
 
+# ---------------------------------------------------------------- sim mode
+# The daemon ALWAYS records a rolling window of world snapshots (zlib'd;
+# ~15 MB for the full window). Sim mode replays that window instead of live
+# telemetry and hard-refuses every real verb. This is the tier-0 safe world:
+# the daemon is the enforcement point, not the game.
+SIM_WINDOW = int(os.environ.get("FRAMESHIFT_SIM_WINDOW", "1800"))  # ticks (1/s)
+SIM_DIR = os.path.expanduser("~/.local/share/wopr/saves")
+_sim = {
+    "buffer": collections.deque(maxlen=SIM_WINDOW),  # list of zlib'd snapshots
+    "playing": False,
+    "idx": 0,
+    "speed": 1.0,       # ticks per real second
+    "last_emit": 0.0,
+    "name": "live-window",
+}
+
+
+def sim_active() -> bool:
+    return _sim["playing"]
+
+
+def sim_record(snap: dict) -> None:
+    _sim["buffer"].append(zlib.compress(
+        json.dumps(snap, separators=(",", ":")).encode(), 1))
+
+
+def sim_next() -> dict | None:
+    """Next replayed snapshot at the configured speed, or None if not playing."""
+    if not _sim["playing"] or not _sim["buffer"]:
+        return None
+    now = time.time()
+    if now - _sim["last_emit"] < 1.0 / max(_sim["speed"], 0.25):
+        return None  # not time for the next replay tick yet
+    _sim["last_emit"] = now
+    _sim["idx"] = (_sim["idx"] + 1) % len(_sim["buffer"])
+    return json.loads(zlib.decompress(_sim["buffer"][_sim["idx"]]))
+
+
+def sim_state() -> dict:
+    return {
+        "playing": _sim["playing"],
+        "idx": _sim["idx"],
+        "length": len(_sim["buffer"]),
+        "speed": _sim["speed"],
+        "name": _sim["name"],
+    }
+
+
+def sim_control(req: dict) -> dict:
+    op = req.get("op")
+    buf = _sim["buffer"]
+    if op == "start":
+        if not buf:
+            return {"ok": False, "error": "nothing recorded yet"}
+        _sim["playing"] = True
+        _sim["idx"] = int(req.get("idx", len(buf) - 1)) % len(buf)
+        _sim["name"] = str(req.get("name", "live-window"))
+        return {"ok": True, "sim": sim_state()}
+    if op == "stop":
+        _sim["playing"] = False
+        return {"ok": True, "sim": sim_state()}
+    if op == "speed":
+        _sim["speed"] = max(0.25, min(8.0, float(req.get("speed", 1.0))))
+        return {"ok": True, "sim": sim_state()}
+    if op == "jump":
+        if buf:
+            _sim["idx"] = int(req.get("idx", 0)) % len(buf)
+        return {"ok": True, "sim": sim_state()}
+    if op == "save":
+        os.makedirs(SIM_DIR, exist_ok=True)
+        name = "".join(c for c in str(req.get("name", "save"))
+                       if c.isalnum() or c in "-_.") or "save"
+        path = os.path.join(SIM_DIR, f"{name}.wopr.gz")
+        with gzip.open(path, "wb") as f:
+            for blob in buf:
+                f.write(blob)
+                f.write(b"\x00\x00\x00\x00")  # zlib stream delimiter
+        return {"ok": True, "path": path, "frames": len(buf)}
+    if op == "load":
+        name = "".join(c for c in str(req.get("name", ""))
+                       if c.isalnum() or c in "-_.")
+        path = os.path.join(SIM_DIR, f"{name}.wopr.gz")
+        if not name or not os.path.exists(path):
+            return {"ok": False, "error": f"no such save: {name or '?'}"}
+        frames = []
+        with gzip.open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                frames.append(chunk)
+        # re-split concatenated zlib streams
+        raw = b"".join(frames)
+        blobs, pos = [], 0
+        while pos < len(raw):
+            end = raw.find(b"\x00\x00\x00\x00", pos)
+            if end < 0:
+                break
+            blobs.append(raw[pos:end])
+            pos = end + 4
+        if not blobs:
+            return {"ok": False, "error": "save is empty or corrupt"}
+        buf.clear()
+        buf.extend(blobs)
+        _sim["playing"] = True
+        _sim["idx"] = 0
+        _sim["name"] = name
+        return {"ok": True, "sim": sim_state()}
+    if op == "list":
+        try:
+            os.makedirs(SIM_DIR, exist_ok=True)
+            saves = sorted(f[:-8] for f in os.listdir(SIM_DIR)
+                           if f.endswith(".wopr.gz"))
+        except OSError:
+            saves = []
+        return {"ok": True, "saves": saves}
+    return {"ok": False, "error": "unknown sim op"}
+
 
 def _ssh_run(host: str, cmd: str, timeout: float = 8.0):
     """Fixed-verb ssh runner. BatchMode: never prompts, never hangs."""
@@ -678,7 +796,15 @@ class _Handler(BaseHTTPRequestHandler):
             req = json.loads(self.rfile.read(n))
             verb = req.get("verb")
             host = req.get("host")
-            if verb == "enemies":
+            if verb == "sim":
+                body = json.dumps(sim_control(req)).encode()
+            elif sim_active():
+                # SIM LOCKOUT: while a replay is playing the daemon refuses
+                # every real verb — kills, rm, ssh, enemy spawns, oracle.
+                # The safe tier is enforced here, server-side, not by the
+                # game's UI. Only "sim" control itself passes.
+                body = json.dumps({"ok": False, "error": "SIM MODE: verbs are frozen. stop the sim first (M)"}).encode()
+            elif verb == "enemies":
                 if "level" in req:
                     ENEMY_LEVEL[0] = max(0, min(2, int(req["level"])))
                 else:
@@ -822,10 +948,19 @@ def _poller():
         t0 = time.time()
         tick += 1
         try:
-            _tend_enemies()
-            _Handler.blob = json.dumps(
-                gather_world(tick), separators=(",", ":")
-            ).encode()
+            replay = sim_next()
+            if replay is not None:
+                # sim mode: serve the replayed frame; enemies/ssh stay frozen
+                replay["sim"] = sim_state()
+                _Handler.blob = json.dumps(
+                    replay, separators=(",", ":")).encode()
+            else:
+                _tend_enemies()
+                snap = gather_world(tick)
+                sim_record(snap)
+                snap["sim"] = sim_state()
+                _Handler.blob = json.dumps(
+                    snap, separators=(",", ":")).encode()
         except Exception as e:  # keep the daemon alive on transient errors
             print(f"tick error: {e}", file=sys.stderr, flush=True)
         time.sleep(max(TICK - (time.time() - t0), 0.05))

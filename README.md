@@ -60,6 +60,7 @@ godot --path game/                      # terminal 2
 | `V` | browse remote files (in a remote world) | — |
 | Hold-`X` | erase (in a vault) | `rm -rf` — real, guarded (as root when armed) |
 | `Y` | arm the Kernel Oracle | sudo ritual · root verbs for 120s |
+| `M` | sim mode: replay the recorded window | all real verbs frozen server-side |
 | `Esc` | leave vault / return home / two-stage exit | — |
 
 Yes, those are real. A Tier-2 protected set (PID 1, the daemon, its ancestors)
@@ -67,7 +68,11 @@ is enforced daemon-side; everything else on your user account is fair game.
 
 ## Danger tiers (design)
 
-1. **Sim** — fake process table, fully safe. *(planned)*
+1. **Sim** — the daemon always records a rolling 30-minute window of real
+   world snapshots; press **M** to replay it. While a replay plays, the
+   daemon **refuses every real verb server-side** — kills, rm, ssh, enemy
+   spawns, even the Oracle. Safety is enforced by the daemon, not the UI.
+   Saves/loads via `~/.local/share/wopr/saves/*.wopr.gz`. *(built)*
 2. **Live** — real PIDs, real signals, protected set, no file verbs. **← built**
    Plus: **vaults** (enter mounts/dirs, hold-X erase guarded `rm -rf`) and
    **SSH travel** (gateways from `~/.ssh/config` → remote worlds, remote
@@ -106,5 +111,5 @@ game.
 - [x] Memory as water level, swap pressure as flood (blood-crest at high swap)
 - [x] zombie processes = ghosts (pale monoliths)
 - [x] systemd respawn = hydra enemies (respawn within 10s of a smite = Hydra)
-- [ ] Sim mode (record/replay a world snapshot)
+- [x] Sim mode (record/replay a world snapshot)
 - [x] The Kernel Oracle (Rust) + YOLO arming ritual + snapper rollback (staged via bootloader)

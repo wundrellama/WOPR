@@ -71,6 +71,8 @@ var arm_screen: Control = null     # YOLO arming ritual screen; null when closed
 var arm_field: LineEdit = null     # masked incantation input
 var arm_status: Label = null       # error/result line inside the ritual screen
 var oracle_armed := false          # mirrored from world["oracle"]["armed"]
+var sim_playing := false           # mirrored from world["sim"]["playing"]
+var sim_info := {}                 # full sim state for the HUD
 var rogue_tags: Dictionary = {}    # pid -> Label3D floating over a ROGUE
 var roads: Dictionary = {}         # ip -> {start, end, mat, packets}
 var kernel_ring_rot := 0.0
@@ -346,6 +348,10 @@ func _on_world(_result: int, code: int, _headers: PackedStringArray, body: Packe
 	if typeof(parsed) != TYPE_DICTIONARY or not parsed.has("procs"):
 		return
 	world = parsed
+	# mirror sim state
+	var sim: Dictionary = world.get("sim", {})
+	sim_info = sim
+	sim_playing = bool(sim.get("playing", false))
 	# mirror the Oracle's armed state; close the ritual screen once armed
 	var orc: Dictionary = world.get("oracle", {})
 	var was_armed := oracle_armed
@@ -808,6 +814,13 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_Y:
 				if mode == "world" and arm_screen == null and not oracle_armed:
 					_build_arm_screen()
+			KEY_M:
+				# toggle sim mode: replay of the recorded window, all verbs
+				# frozen server-side. Safe tier.
+				var op := "stop" if sim_playing else "start"
+				action_http.request(API + "/action", [], HTTPClient.METHOD_POST,
+					JSON.stringify({"verb": "sim", "op": op}))
+				last_action = "leaving sim — back to the live machine" if sim_playing else "entering SIM MODE — replaying the last %d s, verbs frozen" % int(sim_info.get("length", 0))
 			KEY_V:
 				if mode == "remote" and remote_host != "":
 					_enter_vault("~", remote_host)
@@ -1358,7 +1371,7 @@ func _update_hud() -> void:
 			hw.get("mounts", []).size()],
 		"WASD move · Q/E down/up · Shift sprint · mouse look · ESC exit",
 		"F freeze (SIGSTOP) · C resume (SIGCONT) · K smite (SIGKILL) — REAL syscalls",
-		"Y: arm the Kernel Oracle (sudo ritual, root verbs for 120s)" if not oracle_armed else "!!! ORACLE ARMED — K and hold-X run as ROOT !!!",
+		"!!! SIM MODE — replaying '%s' (%d/%d), ALL VERBS FROZEN · M: back to live !!!" % [str(sim_info.get("name", "")), int(sim_info.get("idx", 0)), int(sim_info.get("length", 0))] if sim_playing else "Y: arm the Kernel Oracle (sudo ritual, root verbs for 120s) · M: sim mode (safe replay)" if not oracle_armed else "!!! ORACLE ARMED — K and hold-X run as ROOT !!!",
 		"purple=Kernel Spirit · green=Daemon · cyan=Your Kin · orange=User Agent · gold=Init God · grey=Frozen · pale=Ghost · yellow=Hydra",
 	]
 	var n_rogues: int = world.get("enemies", []).size()
