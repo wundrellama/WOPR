@@ -156,9 +156,14 @@ def gather_world(tick: int) -> dict:
     except OSError:
         pass
     boot = psutil.boot_time()
+    try:
+        me = psutil.Process().username()
+    except psutil.Error:
+        me = "?"
     return {
         "t": time.time(),
         "tick": tick,
+        "me": {"user": me, "pid": os.getpid()},
         "host": {
             "hostname": socket.gethostname(),
             "os": osname,

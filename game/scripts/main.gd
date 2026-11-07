@@ -21,6 +21,9 @@ var yaw := 0.0
 var pitch := -0.25
 var env: Environment
 var hud: Label
+var crosshair: Label
+var hover_label: Label
+var hover_pid: int = -1
 var floor_mesh: MeshInstance3D
 
 func _ready() -> void:
@@ -80,6 +83,24 @@ func _ready() -> void:
 	hud.add_theme_font_size_override("font_size", 14)
 	hud.add_theme_color_override("font_color", Color(0.7, 0.9, 1.0))
 	add_child(hud)
+
+	# --- crosshair + hover readout ---
+	crosshair = Label.new()
+	crosshair.text = "+"
+	crosshair.add_theme_font_size_override("font_size", 22)
+	crosshair.add_theme_color_override("font_color", Color(0.9, 1.0, 1.0, 0.9))
+	crosshair.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	crosshair.grow_vertical = Control.GROW_DIRECTION_BOTH
+	crosshair.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	crosshair.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	add_child(crosshair)
+
+	hover_label = Label.new()
+	hover_label.add_theme_font_size_override("font_size", 15)
+	hover_label.add_theme_color_override("font_color", Color(1.0, 0.9, 0.5))
+	hover_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hover_label.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	add_child(hover_label)
 
 
 func _poll_world() -> void:
@@ -145,11 +166,11 @@ func _sync_world() -> void:
 			mat.albedo_color = Color(0.25, 0.28, 0.32)
 			mat.emission = Color(0.05, 0.06, 0.08)
 		else:
-			# hot processes glow toward red; idle are cool cyan
-			var base := Color(0.1, 0.55, 0.8).lerp(Color(1.0, 0.35, 0.15), cpu)
+			# base hue = species, brightness/pulse = CPU heat
+			var base := _species_color(p)
 			if pid == selected_pid:
-				base = Color(1.0, 0.85, 0.2)
-			mat.albedo_color = base
+				base = Color(1.0, 0.85, 0.2)  # locked target = gold
+			mat.albedo_color = base.darkened(0.35 - cpu * 0.35)
 			mat.emission = base * (0.15 + cpu * 0.65)
 	# remove dead monoliths
 	for pid in monoliths.keys():
@@ -174,6 +195,11 @@ func _process(delta: float) -> void:
 	if Input.is_key_pressed(KEY_E): dir += Vector3.UP
 	if Input.is_key_pressed(KEY_Q): dir += Vector3.DOWN
 	camera.global_position += dir.normalized() * speed * delta
+	# center crosshair on viewport
+	crosshair.position = get_viewport().get_visible_rect().size / 2.0 - Vector2(6, 14)
+	hover_label.position = Vector2(0, get_viewport().get_visible_rect().size.y * 0.72)
+	# hover raycast from screen center
+	_update_hover()
 	# living world breathes; frozen ones don't
 	for pid in monoliths:
 		var body3d: StaticBody3D = monoliths[pid]
@@ -188,6 +214,30 @@ func _proc(pid: int):
 		if p["pid"] == pid:
 			return p
 	return null
+
+
+## Species taxonomy — what KIND of creature this monolith is.
+## Returns {name, color}. Kernel spirits are born of kthreadd (pid 2).
+func _species(p: Dictionary) -> Dictionary:
+	var pid: int = p["pid"]
+	if pid == 0:
+		return {"name": "The Void", "color": Color(0.5, 0.0, 0.6)}
+	if pid == 1:
+		return {"name": "The Init God", "color": Color(1.0, 0.85, 0.0)}
+	if p["ppid"] == 2 or (p["ppid"] == 1 and str(p["name"]).begins_with("[")):
+		return {"name": "Kernel Spirit", "color": Color(0.6, 0.3, 0.9)}
+	var user := str(p["user"])
+	if user == "root":
+		return {"name": "System Daemon", "color": Color(0.2, 0.75, 0.45)}
+	if user == str(world.get("me", {}).get("user", "")):
+		return {"name": "Your Kin", "color": Color(0.2, 0.8, 1.0)}
+	if user == "nobody" or user == "?":
+		return {"name": "Wraith", "color": Color(0.8, 0.2, 0.5)}
+	return {"name": "User Agent", "color": Color(0.95, 0.6, 0.2)}
+
+
+func _species_color(p: Dictionary) -> Color:
+	return _species(p)["color"]
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -215,20 +265,42 @@ func _unhandled_input(event: InputEvent) -> void:
 					_act(9)  # SIGKILL
 
 
-func _pick() -> void:
-	if Input.get_mouse_mode() != Input.MOUSE_MODE_CAPTURED:
-		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
-		return
+func _hover_ray_pid() -> int:
 	var space := camera.get_world_3d().direct_space_state
 	var query := PhysicsRayQueryParameters3D.create(
 		camera.global_position,
 		camera.global_position + camera.global_transform.basis.z * -600.0)
 	var hit := space.intersect_ray(query)
 	if hit.is_empty() or not hit.has("collider"):
-		return
+		return -1
 	for pid in monoliths:
 		if monoliths[pid] == hit["collider"]:
-			selected_pid = pid
+			return pid
+	return -1
+
+
+func _update_hover() -> void:
+	hover_pid = _hover_ray_pid()
+	var p = null
+	if hover_pid >= 0:
+		p = _proc(hover_pid)
+	if p == null:
+		hover_label.text = ""
+		return
+	var sp := _species(p)
+	hover_label.add_theme_color_override("font_color", sp["color"].lightened(0.25))
+	var state_txt := "FROZEN" if p["state"] == "T" else str(p["state"])
+	hover_label.text = "%s  ·  pid %d '%s'  ·  %s  ·  cpu %s%%  ·  %dMB  ·  %s" % [
+		sp["name"], p["pid"], p["name"], state_txt, p["cpu"],
+		int(float(p["mem_rss"]) / 1048576.0), p["user"]]
+
+
+func _pick() -> void:
+	if Input.get_mouse_mode() != Input.MOUSE_MODE_CAPTURED:
+		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+		return
+	if hover_pid >= 0:
+		selected_pid = hover_pid
 
 
 func _act(sig: int) -> void:
@@ -264,6 +336,7 @@ func _update_hud() -> void:
 			net["conns"].size(), net["listeners"].size()],
 		"WASD move · Q/E down/up · Shift sprint · mouse look · ESC quit",
 		"F freeze (SIGSTOP) · C resume (SIGCONT) · Shift+K smite (SIGKILL) — REAL syscalls",
+		"purple=Kernel Spirit · green=Daemon · cyan=Your Kin · orange=User Agent · pink=Wraith · gold=Init God · grey=Frozen",
 		"last: " + last_action,
 	]
 	var p = null
