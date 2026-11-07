@@ -199,8 +199,7 @@ func _make_screen(title: String, sub: String, blink: String) -> Control:
 	panel.color = Color(0.004, 0.01, 0.02, 1.0)
 	panel.set_anchors_preset(Control.PRESET_FULL_RECT)
 	var vb := VBoxContainer.new()
-	vb.set_anchors_preset(Control.PRESET_CENTER)
-	vb.custom_minimum_size = Vector2(1100, 0)
+	vb.set_anchors_preset(Control.PRESET_FULL_RECT)
 	vb.alignment = BoxContainer.ALIGNMENT_CENTER
 	panel.add_child(vb)
 	var t := Label.new()
