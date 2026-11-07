@@ -55,7 +55,69 @@ ENEMY_SPAWN_SECS = float(os.environ.get("FRAMESHIFT_ENEMY_SPAWN", "20"))
 ENEMY_FREEZE_ESCAPE = 8.0
 ENEMIES = {}  # pid -> {"proc": Popen, "spawned": t, "frozen_since": float|None}
 _last_spawn = [0.0]
-ENEMIES_ENABLED = [False]  # opt-in: POST /action {"verb":"enemies","on":true}
+# 0 = off, 1 = local only, 2 = local + remote machines (opt-in per level)
+ENEMY_LEVEL = [0]
+REMOTE_ENEMIES = {}  # host -> {pid: spawned_ts}
+REMOTE_ENEMY_CAP = 2
+_last_remote_spawn = [0.0]
+
+
+def _remote_burn_cmd(ttl: float, hog_mb: int) -> str:
+    """nohup'd burner on the far side; TTL is its only leash (plus purge)."""
+    return ("nohup nice -n 19 python3 -c '%s' %d %d >/dev/null 2>&1 & echo $!"
+            % (_BURN.replace("'", "'\\''"), int(ttl), hog_mb * 1024 * 1024))
+
+
+def _remote_tend_cmd(pids) -> str:
+    """Report each tracked pid's state; SIGCONT any frozen one (a stopped
+    process cannot run its own TTL clock — same leak we plugged locally, and
+    PDEATHSIG is useless over ssh since the session parent exits at once)."""
+    parts = []
+    for p in pids:
+        parts.append(
+            "s=$(awk '{print $3}' /proc/{p}/stat 2>/dev/null || echo Z); "
+            "[ \"$s\" = T ] && kill -CONT {p} 2>/dev/null; echo {p} $s".format(p=p))
+    return "; ".join(parts)
+
+
+def _tend_remote_host(host: str):
+    tracked = REMOTE_ENEMIES.get(host, {})
+    if not tracked:
+        return
+    rc, out, _err = _ssh_run(host, _remote_tend_cmd(tracked.keys()), timeout=10)
+    if rc != 0:
+        return
+    for line in out.splitlines():
+        cols = line.split()
+        if len(cols) == 2 and cols[0].isdigit():
+            if cols[1] in ("Z", "?"):
+                tracked.pop(int(cols[0]), None)
+
+
+def _spawn_remote_enemies():
+    """Best-effort: drop a rogue on each open host that lacks one. Never blocks long."""
+    status = ssh_probe_status()
+    for host, st in status.items():
+        if st != "open":
+            continue
+        _tend_remote_host(host)
+        have = {p: t for p, t in REMOTE_ENEMIES.get(host, {}).items()
+                if time.time() - t < ENEMY_TTL + 30}
+        if len(have) >= REMOTE_ENEMY_CAP:
+            REMOTE_ENEMIES[host] = have
+            continue
+        hog_mb = random.randint(100, 400)
+        rc, out, _err = _ssh_run(host, _remote_burn_cmd(ENEMY_TTL, hog_mb), timeout=10)
+        if rc == 0 and out.strip().isdigit():
+            have[int(out.strip())] = time.time()
+            REMOTE_ENEMIES[host] = have
+
+
+def _purge_remote_enemies():
+    for host, pids in REMOTE_ENEMIES.items():
+        if pids:
+            _ssh_run(host, "kill -9 " + " ".join(str(p) for p in pids), timeout=10)
+    REMOTE_ENEMIES.clear()
 
 
 def _child_guard() -> None:
@@ -102,14 +164,21 @@ def _kill_all_enemies():
         except OSError:
             pass
     ENEMIES.clear()
+    if REMOTE_ENEMIES:
+        try:
+            _purge_remote_enemies()
+        except Exception:
+            pass  # best effort on shutdown
 
 
 def _tend_enemies():
-    """Reap dead, punish freezes, keep the world at population (if opted in)."""
+    """Reap dead, punish freezes, keep the world at population (per level)."""
     now = time.time()
-    if not ENEMIES_ENABLED[0]:
+    if ENEMY_LEVEL[0] == 0:
         if ENEMIES:
             _kill_all_enemies()
+        if REMOTE_ENEMIES:
+            _purge_remote_enemies()
         return
     for pid in list(ENEMIES.keys()):
         e = ENEMIES[pid]
@@ -135,6 +204,19 @@ def _tend_enemies():
             _spawn_enemy()
         except OSError:
             pass
+    if ENEMY_LEVEL[0] >= 2 and now - _last_remote_spawn[0] > ENEMY_SPAWN_SECS:
+        # ssh round-trips are slow: never block the world tick on them
+        if not getattr(_spawn_remote_enemies, "_busy", False):
+            _spawn_remote_enemies._busy = True
+            _last_remote_spawn[0] = now
+            threading.Thread(target=_remote_spawn_thread, daemon=True).start()
+
+
+def _remote_spawn_thread():
+    try:
+        _spawn_remote_enemies()
+    finally:
+        _spawn_remote_enemies._busy = False
 
 _prev_disk = {"t": None, "read": 0, "write": 0}
 
@@ -368,6 +450,7 @@ def remote_world(host: str) -> dict:
         "mem": {"total": total, "available": avail,
                 "percent": round(100.0 * (total - avail) / max(total, 1), 1)},
         "procs": procs,
+        "enemies": sorted(REMOTE_ENEMIES.get(host, {}).keys()),
     }
 
 
@@ -531,7 +614,8 @@ def gather_world(tick: int) -> dict:
         "procs": gather_processes(),
         "net": gather_net(),
         "enemies": sorted(ENEMIES.keys()),
-        "enemies_on": ENEMIES_ENABLED[0],
+        "enemies_level": ENEMY_LEVEL[0],
+        "remote_enemies": {h: sorted(p.keys()) for h, p in REMOTE_ENEMIES.items()},
         "ssh": {"hosts": ssh_hosts(), "status": ssh_probe_status()},
     }
 
@@ -567,11 +651,17 @@ class _Handler(BaseHTTPRequestHandler):
             verb = req.get("verb")
             host = req.get("host")
             if verb == "enemies":
-                ENEMIES_ENABLED[0] = bool(req.get("on"))
-                if not ENEMIES_ENABLED[0]:
+                if "level" in req:
+                    ENEMY_LEVEL[0] = max(0, min(2, int(req["level"])))
+                else:
+                    ENEMY_LEVEL[0] = 1 if req.get("on") else 0
+                if ENEMY_LEVEL[0] == 0:
                     _kill_all_enemies()
+                    _purge_remote_enemies()
+                elif ENEMY_LEVEL[0] == 1 and REMOTE_ENEMIES:
+                    _purge_remote_enemies()
                 body = json.dumps({"ok": True,
-                                   "enemies": ENEMIES_ENABLED[0]}).encode()
+                                   "enemies": ENEMY_LEVEL[0]}).encode()
             elif host:
                 body = json.dumps(remote_action(str(host), req)).encode()
             elif verb == "rm":

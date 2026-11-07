@@ -61,6 +61,7 @@ var ssh_gates: Dictionary = {}     # host -> StaticBody3D
 var hover_ssh_host := ""
 var remote_procs: Array = []
 var remote_monoliths: Dictionary = {}  # pid -> StaticBody3D on remote
+var remote_rogues: Dictionary = {}     # pid -> true for rogues on the remote host
 var remote_tick_timer: Timer
 var ssh_http: HTTPRequest
 var targets: Dictionary = {}       # pid -> Vector3 target (lerped each frame)
@@ -703,10 +704,12 @@ func _unhandled_input(event: InputEvent) -> void:
 				if mode == "remote" and remote_host != "":
 					_enter_vault("~", remote_host)
 			KEY_H:
-				var want: bool = not bool(world.get("enemies_on", false))
+				var lvl: int = (int(world.get("enemies_level", 0)) + 1) % 3
 				action_http.request(API + "/action", [], HTTPClient.METHOD_POST,
-					JSON.stringify({"verb": "enemies", "on": want}))
-				last_action = "hunting %s" % ("ON — rogues will spawn" if want else "OFF — rogues purged")
+					JSON.stringify({"verb": "enemies", "level": lvl}))
+				last_action = ["hunting OFF — rogues purged",
+					"hunting LOCAL ONLY — rogues will spawn here",
+					"hunting LOCAL + REMOTE — rogues on every open host"][lvl]
 
 
 func _process(delta: float) -> void:
@@ -919,6 +922,9 @@ func _render_remote(parsed: Dictionary) -> void:
 	title.position = Vector3(0, 130, 0)
 	remote_root.add_child(title)
 	remote_monoliths.clear()
+	remote_rogues.clear()
+	for rp in parsed.get("enemies", []):
+		remote_rogues[int(rp)] = true
 	for p in remote_procs:
 		var pid: int = int(p["pid"])
 		var mem_mb: float = float(p["mem_rss"]) / 1048576.0
@@ -942,7 +948,9 @@ func _render_remote(parsed: Dictionary) -> void:
 		var mat := StandardMaterial3D.new()
 		mat.emission_enabled = true
 		var color := Color(0.4, 1.0, 0.7)  # remote kin are jade
-		if pid == 1:
+		if remote_rogues.has(pid):
+			color = Color(1.0, 0.1, 0.1)  # ROGUE abroad
+		elif pid == 1:
 			color = Color(1.0, 0.85, 0.0)
 		elif str(p["user"]) == "root":
 			color = Color(0.2, 0.75, 0.45)
@@ -960,6 +968,17 @@ func _render_remote(parsed: Dictionary) -> void:
 		body.position = Vector3(pos.x, height / 2.0, pos.z)
 		remote_root.add_child(body)
 		remote_monoliths[pid] = body
+		if remote_rogues.has(pid):
+			var tag := Label3D.new()
+			tag.text = "▼ ROGUE @ %s ▼" % remote_host
+			tag.font_size = 64
+			tag.pixel_size = 0.02
+			tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+			tag.outline_size = 8
+			tag.outline_modulate = Color(0, 0, 0, 0.9)
+			tag.modulate = Color(1.0, 0.15, 0.15)
+			tag.position = Vector3(pos.x, height + 16.0, pos.z)
+			remote_root.add_child(tag)
 
 
 func _return_home() -> void:
@@ -1003,8 +1022,9 @@ func _update_remote_hover() -> void:
 		hover_label.text = "REMOTE: %s — F/C/Shift+K act on this machine · Esc: return home" % remote_host
 		return
 	hover_label.add_theme_color_override("font_color", Color(0.4, 1.0, 0.7))
+	var what: String = "ROGUE" if remote_rogues.has(int(p["pid"])) else str(_species(p)["name"])
 	hover_label.text = "%s @ %s  ·  pid %d '%s'  ·  %s  ·  cpu %s%%  ·  %dMB  ·  %s" % [
-		_species(p)["name"], remote_host, p["pid"], p["name"], p["state"],
+		what, remote_host, p["pid"], p["name"], p["state"],
 		p["cpu"], int(float(p["mem_rss"]) / 1048576.0), p["user"]]
 
 func _enter_vault(path: String, host: String = "") -> void:
@@ -1224,10 +1244,17 @@ func _update_hud() -> void:
 		"purple=Kernel Spirit · green=Daemon · cyan=Your Kin · orange=User Agent · gold=Init God · grey=Frozen",
 	]
 	var n_rogues: int = world.get("enemies", []).size()
-	if bool(world.get("enemies_on", false)):
-		lines.append("HUNT [H]: ON — %d ROGUE%s alive. Find them: RED monoliths, pulsing, tagged ROGUE, roaming the CPU plains." % [n_rogues, "s" if n_rogues != 1 else ""])
-	else:
-		lines.append("HUNT [H]: OFF — press H to release the rogues")
+	var lvl: int = int(world.get("enemies_level", 0))
+	match lvl:
+		0:
+			lines.append("HUNT [H]: OFF — press H to release the rogues")
+		1:
+			lines.append("HUNT [H]: LOCAL — %d ROGUE%s here. RED, pulsing, tagged, roaming the CPU plains. Press H: +remote." % [n_rogues, "s" if n_rogues != 1 else ""])
+		_:
+			var nrem: int = 0
+			for h in world.get("remote_enemies", {}):
+				nrem += world["remote_enemies"][h].size()
+			lines.append("HUNT [H]: LOCAL+REMOTE — %d ROGUE%s here, %d abroad (travel to hunt). Press H: off." % [n_rogues, "s" if n_rogues != 1 else "", nrem])
 	lines.append("last: " + last_action)
 	var p = null
 	if selected_pid >= 0:
