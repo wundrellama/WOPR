@@ -64,6 +64,8 @@ var remote_monoliths: Dictionary = {}  # pid -> StaticBody3D on remote
 var remote_tick_timer: Timer
 var ssh_http: HTTPRequest
 var targets: Dictionary = {}       # pid -> Vector3 target (lerped each frame)
+var splash: Control = null         # WOPR boot screen; null once playing
+var farewell: Control = null       # end-of-game screen
 var rogue_tags: Dictionary = {}    # pid -> Label3D floating over a ROGUE
 var roads: Dictionary = {}         # ip -> {start, end, mat, packets}
 var kernel_ring_rot := 0.0
@@ -105,7 +107,7 @@ func _ready() -> void:
 	poll_timer.wait_time = 1.0
 	add_child(poll_timer)
 	poll_timer.timeout.connect(_poll_world)
-	_poll_world()
+	_build_splash()
 
 	# --- environment ---
 	var we := WorldEnvironment.new()
@@ -160,22 +162,25 @@ func _ready() -> void:
 	camera.position = HOME_POS
 	add_child(camera)
 	camera.current = true
-	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 
-	# --- HUD ---
+	# --- HUD (hidden until the player commits to playing) ---
 	hud = Label.new()
+	hud.visible = false
 	hud.position = Vector2(16, 12)
 	hud.add_theme_font_size_override("font_size", 14)
 	hud.add_theme_color_override("font_color", Color(0.7, 0.9, 1.0))
 	add_child(hud)
 
 	crosshair = Label.new()
+	crosshair.visible = false
 	crosshair.text = "+"
 	crosshair.add_theme_font_size_override("font_size", 22)
 	crosshair.add_theme_color_override("font_color", Color(0.9, 1.0, 1.0, 0.9))
 	add_child(crosshair)
 
 	hover_label = Label.new()
+	hover_label.visible = false
 	hover_label.add_theme_font_size_override("font_size", 15)
 	hover_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	hover_label.grow_horizontal = Control.GROW_DIRECTION_BOTH
@@ -184,6 +189,83 @@ func _ready() -> void:
 
 func _poll_world() -> void:
 	world_http.request(API + "/world.json")
+
+
+# ---------------------------------------------------------------- WOPR screens
+
+func _make_screen(title: String, sub: String, blink: String) -> Control:
+	var panel := ColorRect.new()
+	panel.color = Color(0.004, 0.01, 0.02, 1.0)
+	panel.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var vb := VBoxContainer.new()
+	vb.set_anchors_preset(Control.PRESET_CENTER)
+	vb.custom_minimum_size = Vector2(1100, 0)
+	vb.alignment = BoxContainer.ALIGNMENT_CENTER
+	panel.add_child(vb)
+	var t := Label.new()
+	t.text = title
+	t.add_theme_font_size_override("font_size", 84)
+	t.add_theme_color_override("font_color", Color(0.25, 1.0, 0.55))
+	t.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vb.add_child(t)
+	var s := Label.new()
+	s.text = sub
+	s.add_theme_font_size_override("font_size", 34)
+	s.add_theme_color_override("font_color", Color(0.6, 0.9, 1.0))
+	s.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vb.add_child(s)
+	var b := Label.new()
+	b.text = blink
+	b.add_theme_font_size_override("font_size", 26)
+	b.add_theme_color_override("font_color", Color(0.9, 1.0, 0.9))
+	b.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vb.add_child(b)
+	# blink timer
+	var tm := Timer.new()
+	tm.wait_time = 0.7
+	tm.autostart = true
+	vb.add_child(tm)
+	tm.timeout.connect(func(): b.visible = not b.visible)
+	return panel
+
+
+func _build_splash() -> void:
+	splash = _make_screen("W O P R",
+		"\"The only winning move is not to play.\"",
+		"— PRESS ENTER TO PLAY —")
+	add_child(splash)
+	splash.move_to_front()
+
+
+func _start_game() -> void:
+	splash.queue_free()
+	splash = null
+	hud.visible = true
+	crosshair.visible = true
+	hover_label.visible = true
+	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+	_poll_world()
+	poll_timer.start()
+
+
+func _show_farewell() -> void:
+	poll_timer.stop()
+	if mode == "remote":
+		_return_home()
+	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+	hud.visible = false
+	crosshair.visible = false
+	hover_label.visible = false
+	_build_farewell()
+
+
+func _build_farewell() -> void:
+	if farewell != null:
+		return
+	farewell = _make_screen("How about a nice game of chess?",
+		"",
+		"— PRESS ENTER TO RETURN —")
+	add_child(farewell)
 
 
 func _on_world(_result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
@@ -566,6 +648,17 @@ func _species_color(p: Dictionary) -> Color:
 # ---------------------------------------------------------------- input
 
 func _unhandled_input(event: InputEvent) -> void:
+	if splash != null or farewell != null:
+		if event is InputEventKey and event.pressed and (
+				event.keycode == KEY_ENTER or event.keycode == KEY_KP_ENTER):
+			if splash != null:
+				_start_game()
+			else:
+				# back to the title screen for another round
+				farewell.queue_free()
+				farewell = null
+				_build_splash()
+		return
 	if event is InputEventMouseMotion and Input.get_mouse_mode() == Input.MOUSE_MODE_CAPTURED:
 		yaw -= event.relative.x * 0.0025
 		pitch = clampf(pitch - event.relative.y * 0.0025, -1.4, 1.4)
@@ -583,7 +676,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				elif mode == "remote":
 					_return_home()
 				else:
-					get_tree().quit()
+					_show_farewell()
 			KEY_ENTER, KEY_KP_ENTER:
 				if mode == "vault":
 					_vault_open_hovered()
@@ -1126,7 +1219,7 @@ func _update_hud() -> void:
 			str(hw.get("gpu_busy", "?")), world["procs"].size(),
 			net["conns"].size(), net["remote_hosts"].size(),
 			hw.get("mounts", []).size()],
-		"WASD move · Q/E down/up · Shift sprint · mouse look · ESC quit",
+		"WASD move · Q/E down/up · Shift sprint · mouse look · ESC exit",
 		"F freeze (SIGSTOP) · C resume (SIGCONT) · Shift+K smite (SIGKILL) — REAL syscalls",
 		"purple=Kernel Spirit · green=Daemon · cyan=Your Kin · orange=User Agent · gold=Init God · grey=Frozen",
 	]

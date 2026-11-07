@@ -1,8 +1,10 @@
-# Frameshift
+# WOPR
+
+*(formerly Frameshift)*
 
 An open world exploration game where the world is the virtual insides of the
 actual machine running the game. Every monolith is a real process. Every spell
-is a real syscall.
+is a real syscall. "Shall we play a game?"
 
 ## Layout
 
