@@ -220,6 +220,28 @@ def _remote_spawn_thread():
 
 _prev_disk = {"t": None, "read": 0, "write": 0}
 
+# --- hydras: processes that respawn right after being smited ---
+_recent_kills = {}  # name -> (kill_time, killed_pid)
+HYDRA_WINDOW = 10.0
+
+
+def _note_kill(pid: int, name: str) -> None:
+    _recent_kills[name] = (time.time(), pid)
+
+
+def _hydra_flags(procs) -> None:
+    """Tag procs born within HYDRA_WINDOW of a smite of the same name."""
+    now = time.time()
+    stale = [n for n, (t, _) in _recent_kills.items() if now - t > HYDRA_WINDOW]
+    for n in stale:
+        del _recent_kills[n]
+    if not _recent_kills:
+        return
+    for p in procs:
+        hit = _recent_kills.get(p["name"])
+        if hit and p["pid"] != hit[1] and p["age"] <= HYDRA_WINDOW:
+            p["hydra"] = True
+
 
 def _read_process_state(pid: int) -> str:
     """Get real process state from /proc (psutil 'running' vs our frozen check)."""
@@ -267,6 +289,7 @@ def gather_processes():
             "cpu_num": info.get("cpu_num", -1) if info.get("cpu_num", -1) is not None else -1,
             "cmdline": " ".join(info.get("cmdline") or [])[:200],
         })
+    _hydra_flags(procs)
     return procs
 
 
@@ -406,7 +429,8 @@ def ssh_probe_status() -> dict:
     if not c["refreshing"] and time.time() - c["t"] > 30:
         c["refreshing"] = True
         threading.Thread(target=_ssh_probe_refresh, daemon=True).start()
-    return c["status"]
+    # copy: the refresh thread mutates the live dict; the world tick iterates it
+    return dict(c["status"])
 
 
 _REMOTE_WORLD = (
@@ -615,7 +639,7 @@ def gather_world(tick: int) -> dict:
         "net": gather_net(),
         "enemies": sorted(ENEMIES.keys()),
         "enemies_level": ENEMY_LEVEL[0],
-        "remote_enemies": {h: sorted(p.keys()) for h, p in REMOTE_ENEMIES.items()},
+        "remote_enemies": {h: sorted(p.keys()) for h, p in dict(REMOTE_ENEMIES).items()},
         "ssh": {"hosts": ssh_hosts(), "status": ssh_probe_status()},
     }
 
@@ -683,6 +707,13 @@ class _Handler(BaseHTTPRequestHandler):
             raise ValueError("verb must be 'kill', sig must be 19/18/9")
         if pid in _Handler._protected():
             raise ValueError(f"pid {pid} is protected")
+        if sig == 9:
+            # remember the victim's name so a respawn can be flagged as hydra
+            try:
+                with open(f"/proc/{pid}/comm", "rb") as f:
+                    _note_kill(pid, f.read().decode().strip())
+            except OSError:
+                pass
         os.kill(pid, sig)
         return json.dumps({"ok": True, "syscall": f"kill({pid}, {sig})"}).encode()
 

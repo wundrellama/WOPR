@@ -94,8 +94,9 @@ game.
 - [x] Live telemetry daemon (procs, cpu, mem, disk, sockets, listeners)
 - [x] Godot world render + fly camera + HUD
 - [x] Tier-2 freeze/resume/smite with protected set
-- [ ] Network bridges rendered as light-roads to remote-host towers
-- [ ] Memory as water level, swap pressure as flood
-- [ ] systemd respawn = hydra enemies; zombie processes = ghosts
+- [x] Network bridges rendered as light-roads to remote-host towers
+- [x] Memory as water level, swap pressure as flood (blood-crest at high swap)
+- [x] zombie processes = ghosts (pale monoliths)
+- [x] systemd respawn = hydra enemies (respawn within 10s of a smite = Hydra)
 - [ ] Sim mode (record/replay a world snapshot)
 - [ ] The Kernel Oracle (Rust) + YOLO arming ritual + snapper rollback

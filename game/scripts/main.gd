@@ -412,8 +412,16 @@ func _tower_pos(idx: int, total: int) -> Vector3:
 
 
 func _update_geo() -> void:
-	# tide: memory percent -> water height (lerped in _process for smoothness)
-	water_y = lerpf(2.0, 60.0, float(world["mem"]["percent"]) / 100.0)
+	# tide: memory percent raises the water; swap pressure floods higher
+	# and turns the crest blood-tinged — swap means the machine is drowning
+	var mem_pct: float = float(world["mem"]["percent"])
+	var sw_total: float = float(world["mem"].get("swap_total", 0))
+	var sw_pct: float = (float(world["mem"].get("swap_used", 0)) / sw_total * 100.0) if sw_total > 0 else 0.0
+	water_y = lerpf(2.0, 60.0, mem_pct / 100.0) + lerpf(0.0, 45.0, sw_pct / 100.0)
+	if water.material_override is ShaderMaterial:
+		var drown: float = clampf(sw_pct / 100.0, 0.0, 1.0)
+		water.material_override.set_shader_parameter("crest_color",
+			Color(0.15, 0.75, 1.0).lerp(Color(1.0, 0.3, 0.15), drown))
 
 	# forge glow: gpu busy
 	if forge_body != null:
@@ -628,6 +636,10 @@ func _species(p: Dictionary) -> Dictionary:
 	var pid: int = p["pid"]
 	if pid in world.get("enemies", []):
 		return {"name": "ROGUE", "color": Color(1.0, 0.1, 0.1)}
+	if bool(p.get("hydra", false)):
+		return {"name": "Hydra", "color": Color(0.9, 0.75, 0.1)}
+	if str(p["state"]) == "Z":
+		return {"name": "Ghost", "color": Color(0.75, 0.9, 0.8)}
 	if pid == 0:
 		return {"name": "The Void", "color": Color(0.5, 0.0, 0.6)}
 	if pid == 1:
@@ -1243,14 +1255,15 @@ func _update_hud() -> void:
 	var hw: Dictionary = world.get("hw", {})
 	var lines := [
 		"%s — %s | tick %d" % [host["hostname"], host["os"], world["tick"]],
-		"CPU %d%%  MEM %d%% (tide)  GPU %s%%  procs %d  bridges %d  cities %d  mounts %d" % [
+		"CPU %d%%  MEM %d%% (tide)  SWAP %d%%  GPU %s%%  procs %d  bridges %d  cities %d  mounts %d" % [
 			int(cpu["total"]), int(mem["percent"]),
+			int(mem["swap_used"] / maxf(float(mem["swap_total"]), 1.0) * 100.0),
 			str(hw.get("gpu_busy", "?")), world["procs"].size(),
 			net["conns"].size(), net["remote_hosts"].size(),
 			hw.get("mounts", []).size()],
 		"WASD move · Q/E down/up · Shift sprint · mouse look · ESC exit",
 		"F freeze (SIGSTOP) · C resume (SIGCONT) · Shift+K smite (SIGKILL) — REAL syscalls",
-		"purple=Kernel Spirit · green=Daemon · cyan=Your Kin · orange=User Agent · gold=Init God · grey=Frozen",
+		"purple=Kernel Spirit · green=Daemon · cyan=Your Kin · orange=User Agent · gold=Init God · grey=Frozen · pale=Ghost · yellow=Hydra",
 	]
 	var n_rogues: int = world.get("enemies", []).size()
 	var lvl: int = int(world.get("enemies_level", 0))
