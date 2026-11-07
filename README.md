@@ -58,7 +58,8 @@ godot --path game/                      # terminal 2
 | `H` | hunt: cycle off / local / +remote rogues | spawns real burner processes |
 | `Enter` | descend vault / travel gate | — |
 | `V` | browse remote files (in a remote world) | — |
-| Hold-`X` | erase (in a vault) | `rm -rf` — real, guarded |
+| Hold-`X` | erase (in a vault) | `rm -rf` — real, guarded (as root when armed) |
+| `Y` | arm the Kernel Oracle | sudo ritual · root verbs for 120s |
 | `Esc` | leave vault / return home / two-stage exit | — |
 
 Yes, those are real. A Tier-2 protected set (PID 1, the daemon, its ancestors)
@@ -71,14 +72,21 @@ is enforced daemon-side; everything else on your user account is fair game.
    Plus: **vaults** (enter mounts/dirs, hold-X erase guarded `rm -rf`) and
    **SSH travel** (gateways from `~/.ssh/config` → remote worlds, remote
    kill/rm via fixed verbs, remote file browsing with `V`).
-3. **YOLO** — root "Kernel Oracle" helper: `rm -rf`, `systemctl stop`,
-   `rmmod`, everything. Requires sudo as the arming ritual and a btrfs
-   snapshot (`snapper create`) to exist before arming — as a *ritual*, not a
-   promise: the Oracle can erase the snapshot store too. That is intended.
-   *(planned)*
+3. **YOLO** — root "Kernel Oracle" helper: `kill` any pid, `systemctl`,
+   `modprobe ±r`, `rm -rf`, snapshots. Press **Y** in-game, speak the
+   incantation (your sudo password — piped to sudo, never stored), and the
+   Oracle arms **only if a snapper snapshot exists** — a *ritual*, not a
+   promise: erasing the snapshot store is a supported verb (it demands
+   `--i-know` and logs it in caps). Armed for 120s, then cold. Every verb
+   is written to a write-ahead log *before* it runs.
+   *(built — first live use is your call, on a machine you can afford)*
+   One-time setup: `sudo snapper -c root create-config /` and a
+   `sudo snapper -c root create -c pre -d "wopr baseline"`.
 
-The Oracle will expose **verbs, never a shell** — path arguments, not command
-strings — so the privileged surface stays one small auditable binary.
+The Oracle exposes **verbs, never a shell** — fixed argv arrays, allowlisted
+actions, path arguments only. Zero Rust dependencies, ~450 auditable lines
+(`oracle/`). The daemon itself never runs as root; the Oracle is spawned by
+`sudo -S` and its socket is 0600 owned by the user who armed it.
 
 ## Enemies
 
@@ -99,4 +107,4 @@ game.
 - [x] zombie processes = ghosts (pale monoliths)
 - [x] systemd respawn = hydra enemies (respawn within 10s of a smite = Hydra)
 - [ ] Sim mode (record/replay a world snapshot)
-- [ ] The Kernel Oracle (Rust) + YOLO arming ritual + snapper rollback
+- [x] The Kernel Oracle (Rust) + YOLO arming ritual + snapper rollback (staged via bootloader)

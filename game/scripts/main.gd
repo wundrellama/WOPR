@@ -67,6 +67,10 @@ var ssh_http: HTTPRequest
 var targets: Dictionary = {}       # pid -> Vector3 target (lerped each frame)
 var splash: Control = null         # WOPR boot screen; null once playing
 var farewell: Control = null       # end-of-game screen
+var arm_screen: Control = null     # YOLO arming ritual screen; null when closed
+var arm_field: LineEdit = null     # masked incantation input
+var arm_status: Label = null       # error/result line inside the ritual screen
+var oracle_armed := false          # mirrored from world["oracle"]["armed"]
 var rogue_tags: Dictionary = {}    # pid -> Label3D floating over a ROGUE
 var roads: Dictionary = {}         # ip -> {start, end, mat, packets}
 var kernel_ring_rot := 0.0
@@ -238,6 +242,72 @@ func _build_splash() -> void:
 	splash.move_to_front()
 
 
+# ---------------------------------------------------------------- YOLO ritual
+
+func _build_arm_screen() -> void:
+	var panel := ColorRect.new()
+	panel.color = Color(0.02, 0.004, 0.004, 0.96)
+	panel.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var vb := VBoxContainer.new()
+	vb.set_anchors_preset(Control.PRESET_FULL_RECT)
+	vb.alignment = BoxContainer.ALIGNMENT_CENTER
+	vb.custom_minimum_size = Vector2(700, 0)
+	panel.add_child(vb)
+	var t := Label.new()
+	t.text = "THE KERNEL ORACLE"
+	t.add_theme_font_size_override("font_size", 54)
+	t.add_theme_color_override("font_color", Color(1.0, 0.35, 0.25))
+	t.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vb.add_child(t)
+	var s := Label.new()
+	s.text = "Speak the incantation (your sudo password).\nThe Oracle will demand a snapshot exists before it arms.\nArmed for 120s. Every verb is logged before it runs.\nThis can destroy the machine. Including the snapshots."
+	s.add_theme_font_size_override("font_size", 24)
+	s.add_theme_color_override("font_color", Color(0.9, 0.75, 0.7))
+	s.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vb.add_child(s)
+	arm_field = LineEdit.new()
+	arm_field.secret_character_modulation = Color(1, 1, 1)
+	arm_field.secret_character = "•"
+	arm_field.placeholder_text = "incantation"
+	arm_field.custom_minimum_size = Vector2(420, 44)
+	arm_field.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vb.add_child(arm_field)
+	arm_status = Label.new()
+	arm_status.text = "press ENTER to speak · ESC to back away"
+	arm_status.add_theme_font_size_override("font_size", 20)
+	arm_status.add_theme_color_override("font_color", Color(0.7, 0.7, 0.8))
+	arm_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vb.add_child(arm_status)
+	arm_field.text_submitted.connect(_on_incantation)
+	arm_screen = panel
+	add_child(arm_screen)
+	arm_screen.move_to_front()
+	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+	arm_field.grab_focus()
+
+
+func _close_arm_screen() -> void:
+	if arm_screen != null:
+		arm_screen.queue_free()
+	arm_screen = null
+	arm_field = null
+	arm_status = null
+	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+
+
+func _on_incantation(text: String) -> void:
+	if arm_status != null:
+		arm_status.text = "speaking... the Oracle listens"
+	action_http.request(API + "/action", [], HTTPClient.METHOD_POST,
+		JSON.stringify({"verb": "oracle_arm", "incantation": text}))
+	# response lands in _on_action; on success we close from the world poll
+
+
+func _oracle_verb(line: String) -> void:
+	action_http.request(API + "/action", [], HTTPClient.METHOD_POST,
+		JSON.stringify({"verb": "oracle", "line": line}))
+
+
 func _start_game() -> void:
 	splash.queue_free()
 	splash = null
@@ -276,6 +346,15 @@ func _on_world(_result: int, code: int, _headers: PackedStringArray, body: Packe
 	if typeof(parsed) != TYPE_DICTIONARY or not parsed.has("procs"):
 		return
 	world = parsed
+	# mirror the Oracle's armed state; close the ritual screen once armed
+	var orc: Dictionary = world.get("oracle", {})
+	var was_armed := oracle_armed
+	oracle_armed = bool(orc.get("armed", false))
+	if oracle_armed and arm_screen != null:
+		_close_arm_screen()
+		last_action = "THE ORACLE IS ARMED (120s). K now kills as root."
+	elif was_armed and not oracle_armed:
+		last_action = "the Oracle went cold. re-arm with Y if you dare."
 	if not built_geo:
 		_build_geography()
 		built_geo = true
@@ -663,6 +742,11 @@ func _species_color(p: Dictionary) -> Color:
 # ---------------------------------------------------------------- input
 
 func _unhandled_input(event: InputEvent) -> void:
+	if arm_screen != null:
+		# the ritual screen owns all input while open
+		if event is InputEventKey and event.pressed and event.keycode == KEY_ESCAPE:
+			_close_arm_screen()
+		return
 	if splash != null or farewell != null:
 		if event is InputEventKey and event.pressed:
 			if event.keycode == KEY_ENTER or event.keycode == KEY_KP_ENTER:
@@ -715,7 +799,15 @@ func _unhandled_input(event: InputEvent) -> void:
 					_act(18)   # SIGCONT
 			KEY_K:
 				if mode != "vault":
-					_act(9)  # SIGKILL
+					if oracle_armed and mode != "remote" and selected_pid >= 0:
+						# armed: the Oracle's root kill crosses the ownership wall
+						_oracle_verb("kill %d 9" % selected_pid)
+						last_action = "ORACLE kill(%d, 9)..." % selected_pid
+					else:
+						_act(9)  # SIGKILL
+			KEY_Y:
+				if mode == "world" and arm_screen == null and not oracle_armed:
+					_build_arm_screen()
 			KEY_V:
 				if mode == "remote" and remote_host != "":
 					_enter_vault("~", remote_host)
@@ -1208,6 +1300,11 @@ func _vault_erase() -> void:
 		return
 	var e: Dictionary = hit["entry"]
 	var full := vault_path.rstrip("/") + "/" + str(e["name"])
+	if oracle_armed and vault_host == "":
+		# armed: the Oracle erases as root — guardrails are its own now
+		_oracle_verb("rm '%s'" % full)
+		last_action = "ORACLE erasing %s..." % full
+		return
 	var payload := {"verb": "rm", "path": full, "confirm": true}
 	if vault_host != "":
 		payload["host"] = vault_host
@@ -1231,9 +1328,11 @@ func _act(sig: int) -> void:
 func _on_action(_result: int, _code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
 	var resp = JSON.parse_string(body.get_string_from_utf8())
 	if typeof(resp) == TYPE_DICTIONARY and resp.get("ok", false):
-		last_action = "fired " + str(resp.get("syscall", ""))
+		last_action = "fired " + str(resp.get("syscall", resp.get("result", "")))
 	else:
 		last_action = "REFUSED: " + str(resp.get("error", "unknown"))
+		if arm_screen != null and arm_status != null:
+			arm_status.text = str(resp.get("error", "the Oracle refuses"))
 
 # ---------------------------------------------------------------- hud
 
@@ -1259,6 +1358,7 @@ func _update_hud() -> void:
 			hw.get("mounts", []).size()],
 		"WASD move · Q/E down/up · Shift sprint · mouse look · ESC exit",
 		"F freeze (SIGSTOP) · C resume (SIGCONT) · K smite (SIGKILL) — REAL syscalls",
+		"Y: arm the Kernel Oracle (sudo ritual, root verbs for 120s)" if not oracle_armed else "!!! ORACLE ARMED — K and hold-X run as ROOT !!!",
 		"purple=Kernel Spirit · green=Daemon · cyan=Your Kin · orange=User Agent · gold=Init God · grey=Frozen · pale=Ghost · yellow=Hydra",
 	]
 	var n_rogues: int = world.get("enemies", []).size()

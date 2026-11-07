@@ -37,6 +37,9 @@ import subprocess
 import sys
 import threading
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import oracle_bridge  # noqa: E402  (Kernel Oracle client side)
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -641,6 +644,7 @@ def gather_world(tick: int) -> dict:
         "enemies_level": ENEMY_LEVEL[0],
         "remote_enemies": {h: sorted(p.keys()) for h, p in dict(REMOTE_ENEMIES).items()},
         "ssh": {"hosts": ssh_hosts(), "status": ssh_probe_status()},
+        "oracle": oracle_bridge.status(),
     }
 
 
@@ -690,6 +694,22 @@ class _Handler(BaseHTTPRequestHandler):
                 body = json.dumps(remote_action(str(host), req)).encode()
             elif verb == "rm":
                 body = self._do_rm(req)
+            elif verb == "oracle_arm":
+                # the incantation is the sudo password. it is piped to sudo
+                # and never logged, stored, or echoed by this daemon.
+                body = json.dumps(oracle_bridge.arm(str(req.get("incantation", "")))).encode()
+            elif verb == "oracle_disarm":
+                body = json.dumps(oracle_bridge.disarm()).encode()
+            elif verb == "oracle":
+                # fixed-verb passthrough: "kill 123 9", "rm /path --i-know",
+                # "systemctl stop foo", "snapshot create desc", ...
+                # The Oracle is the authority on what is allowed.
+                line = str(req.get("line", ""))
+                if not line.strip():
+                    raise ValueError("oracle verb requires 'line'")
+                out = oracle_bridge.verb(line.strip())
+                out.setdefault("verb", line.strip())
+                body = json.dumps(out).encode()
             else:
                 body = self._do_kill(req)
         except Exception as e:
@@ -796,6 +816,7 @@ def main():
 
 def _poller():
     atexit.register(_kill_all_enemies)
+    atexit.register(oracle_bridge.shutdown)
     tick = 0
     while True:
         t0 = time.time()
