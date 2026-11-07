@@ -34,6 +34,7 @@ import gzip
 import os
 import random
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -929,15 +930,47 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # --parent <pid>: game-owned lifecycle. When the game dies (even by
+    # SIGKILL), the daemon shuts itself down — enemies, oracle, everything,
+    # via the atexit handlers. "Quit the game" means "everything stops".
+    parent_pid = 0
+    if "--parent" in sys.argv:
+        try:
+            parent_pid = int(sys.argv[sys.argv.index("--parent") + 1])
+        except (IndexError, ValueError):
+            pass
+
+    def _bye(*_a):
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _bye)
+
+    if parent_pid > 0:
+        threading.Thread(target=_watch_parent, args=(parent_pid,),
+                         daemon=True).start()
+
     threading.Thread(target=_poller, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), _Handler)
-    print(f"frameshiftd: http://127.0.0.1:{PORT}/world.json every {TICK}s", flush=True)
+    print(f"frameshiftd: http://127.0.0.1:{PORT}/world.json every {TICK}s"
+          + (f" (parent {parent_pid})" if parent_pid else ""), flush=True)
     try:
         srv.serve_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         srv.server_close()
+
+
+def _watch_parent(pid: int):
+    while True:
+        time.sleep(2.0)
+        try:
+            os.kill(pid, 0)  # existence check, no signal delivered
+        except ProcessLookupError:
+            print("parent game is gone — daemon shutting down", flush=True)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return
+        except PermissionError:
+            pass  # pid exists but isn't ours; keep running
 
 
 def _poller():

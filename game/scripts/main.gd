@@ -73,6 +73,7 @@ var arm_status: Label = null       # error/result line inside the ritual screen
 var oracle_armed := false          # mirrored from world["oracle"]["armed"]
 var sim_playing := false           # mirrored from world["sim"]["playing"]
 var sim_info := {}                 # full sim state for the HUD
+var daemon_pid := -1               # daemon we spawned ourselves (-1 = adopted)
 var rogue_tags: Dictionary = {}    # pid -> Label3D floating over a ROGUE
 var roads: Dictionary = {}         # ip -> {start, end, mat, packets}
 var kernel_ring_rot := 0.0
@@ -86,6 +87,11 @@ const FORGE_Z := -800.0
 const HOME_POS := Vector3(0, 240, 1250)
 
 func _ready() -> void:
+	# game owns the daemon: adopt a running one, else spawn a child that
+	# watches our pid. On exit we shut it down either way — quitting the
+	# game stops EVERYTHING (recording, enemies, oracle).
+	if not _daemon_running():
+		_spawn_daemon()
 	world_http = HTTPRequest.new()
 	add_child(world_http)
 	world_http.request_completed.connect(_on_world)
@@ -194,8 +200,62 @@ func _ready() -> void:
 	add_child(hover_label)
 
 
+func _notification(what: int) -> void:
+	# window close button / OS-level quit: same contract — everything stops
+	if what == NOTIFICATION_WM_CLOSE_REQUEST:
+		_shutdown_daemon()
+
+
 func _poll_world() -> void:
 	world_http.request(API + "/world.json")
+
+
+# ---------------------------------------------------------------- daemon lifecycle
+
+func _daemon_running() -> bool:
+	# synchronous TCP probe on boot: is something already on 8765?
+	var tcp := StreamPeerTCP.new()
+	if tcp.connect_to_host("127.0.0.1", 8765) != OK:
+		return false
+	var deadline := Time.get_ticks_msec() + 1000
+	while tcp.get_status() == StreamPeerTCP.STATUS_CONNECTING \
+			and Time.get_ticks_msec() < deadline:
+		tcp.poll()
+		OS.delay_msec(20)
+	var up := tcp.get_status() == StreamPeerTCP.STATUS_CONNECTED
+	tcp.close()
+	return up
+
+
+func _spawn_daemon() -> void:
+	# the daemon lives next to the game project: ../telemetry/frameshiftd.py
+	var script := ProjectSettings.globalize_path("res://../telemetry/frameshiftd.py")
+	if not FileAccess.file_exists(script):
+		push_warning("frameshiftd.py not found at " + script)
+		return
+	daemon_pid = OS.create_process("python3",
+		[script, "--parent", str(OS.get_process_id())])
+	if daemon_pid <= 0:
+		push_warning("could not spawn frameshiftd (pid %d)" % daemon_pid)
+		daemon_pid = -1
+
+
+func _shutdown_daemon() -> void:
+	# quit means EVERYTHING stops: recording, enemies, oracle. Prefer the
+	# pid we spawned; otherwise ask the daemon itself (world.json reports
+	# its pid) so an adopted daemon dies too. SIGTERM, not SIGKILL: the
+	# daemon's atexit handlers must run to clean up enemy procs + oracle.
+	var pid := daemon_pid
+	if pid <= 0:
+		pid = int(world.get("me", {}).get("pid", 0))
+	if pid > 0:
+		OS.create_process("kill", ["-TERM", str(pid)])
+	daemon_pid = -1
+
+
+func _quit_game() -> void:
+	_shutdown_daemon()
+	get_tree().quit()
 
 
 # ---------------------------------------------------------------- WOPR screens
@@ -763,7 +823,7 @@ func _unhandled_input(event: InputEvent) -> void:
 					farewell = null
 					_build_splash()
 			elif event.keycode == KEY_ESCAPE:
-				get_tree().quit()
+				_quit_game()
 		return
 	if event is InputEventMouseMotion and Input.get_mouse_mode() == Input.MOUSE_MODE_CAPTURED:
 		yaw -= event.relative.x * 0.0025
