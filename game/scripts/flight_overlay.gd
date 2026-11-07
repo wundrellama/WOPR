@@ -3,6 +3,7 @@ extends Control
 var viewer: Camera3D
 var target: Node3D
 var hunt_targets: Dictionary = {}
+var junk_targets: Dictionary = {}
 var ink := Color("93bdbd")
 var mono := SystemFont.new()
 
@@ -97,13 +98,28 @@ func hunt_label_rect(point: Vector2, text_size: Vector2, occupied: Array) -> Rec
 	return candidate
 
 
+static func junk_display_name(full_name: String) -> String:
+	# Keep a distinguishing suffix, but never alter registry/path/wire values.
+	return full_name if full_name.length() <= 20 else full_name.left(12) + "…" + full_name.right(7)
+
+
 func _draw_hunt_markers() -> void:
-	var color := Color("ff8976")
 	var occupied: Array = []
+	var markers: Array = []
 	for pid in hunt_targets:
-		var body: Node3D = hunt_targets[pid]
+		markers.append({"body": hunt_targets[pid], "text": "ROGUE %d" % int(pid), "color": Color("ff8976")})
+	for id in junk_targets:
+		var body: Variant = junk_targets[id]
 		if not is_instance_valid(body):
 			continue
+		var record: Dictionary = body.get_meta("junk", {})
+		var label := "VAULT " + junk_display_name(str(record.get("parent", ""))) if body.has_meta("junk_vault_beacon") else "%s LINK %s" % ["JUNK NEST" if bool(record.get("dir", false)) else "JUNK FILE", junk_display_name(str(record.get("name", id)))]
+		markers.append({"body": body, "text": label, "color": Color("ff65c5")})
+	for item: Dictionary in markers:
+		var body: Variant = item.body
+		if not is_instance_valid(body):
+			continue
+		var color: Color = item.color
 		var marker := hunt_marker(body.global_position)
 		var point: Vector2 = marker["point"]
 		if marker["offscreen"]:
@@ -116,7 +132,7 @@ func _draw_hunt_markers() -> void:
 					var corner := point + Vector2(sx * 11, sy * 11)
 					draw_line(corner, corner - Vector2(sx * 5, 0), color, 1.5, true)
 					draw_line(corner, corner - Vector2(0, sy * 5), color, 1.5, true)
-		var text := "ROGUE %d / %.0fm%s" % [int(pid), float(marker["distance"]), " / BEHIND" if marker["behind"] else ""]
+		var text := "%s / %.0fm%s" % [str(item.text), float(marker["distance"]), " / BEHIND" if marker["behind"] else ""]
 		var text_size := mono.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, 13)
 		var label_rect := hunt_label_rect(point, text_size, occupied)
 		occupied.append(label_rect)

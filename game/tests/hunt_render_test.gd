@@ -26,7 +26,7 @@ func _run() -> void:
 	check(game._species(p).name == "ROGUE", "JSON enemy PID is recognized as a rogue")
 	check(game.rogue_tags.has(pid), "recognized rogue gets a visible targeting label")
 	var position: Vector3 = game._district_pos(p)
-	check(absf(position.z - game.PLAINS_Z) < 450.0, "rogue uses roaming CPU-plains geography")
+	check(position.is_equal_approx(game._rogue_roam_pos(pid, game.rogue_clock, false)), "rogue uses the field-wide route with network access disabled")
 	if game.rogue_tags.has(pid):
 		var tag: Label3D = game.rogue_tags[pid]
 		check(tag.pixel_size * tag.font_size >= 8.0, "rogue tag remains readable at gameplay distance")

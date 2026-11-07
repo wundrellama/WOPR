@@ -44,6 +44,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import oracle_bridge  # noqa: E402  (Kernel Oracle client side)
+import junk_hunt  # noqa: E402  (isolated stdlib owned-writer subsystem)
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -57,7 +58,7 @@ TICK = float(os.environ.get("FRAMESHIFT_TICK", "1.0"))
 _shutdown_started = threading.Event()
 
 # --- enemies: real CPU-burner child processes the player must hunt ---
-ENEMY_CAP = int(os.environ.get("FRAMESHIFT_ENEMIES", "4"))
+ENEMY_CAP = max(0, min(4, int(os.environ.get("FRAMESHIFT_ENEMIES", "4"))))
 ENEMY_TTL = float(os.environ.get("FRAMESHIFT_ENEMY_TTL", "180"))
 ENEMY_SPAWN_SECS = float(os.environ.get("FRAMESHIFT_ENEMY_SPAWN", "20"))
 ENEMY_FREEZE_ESCAPE = 8.0
@@ -68,6 +69,181 @@ ENEMY_LEVEL = [0]
 REMOTE_ENEMIES = {}  # host -> {pid: spawned_ts}
 REMOTE_ENEMY_CAP = 2
 _last_remote_spawn = [0.0]
+_junk_lock = threading.RLock()
+_hunt_transition_lock = threading.RLock()
+_junk_helpers = {}  # requested SSH alias -> Helper; empty string = local
+_junk_errors = {}
+_junk_generation = [0]
+JUNK_REMOTE_HOST_CAP = 4
+
+
+def _junk_enabled(host=""):
+    return (not _shutdown_started.is_set() and not sim_active()
+            and ENEMY_LEVEL[0] >= (2 if host else 1))
+
+
+def _junk_snapshot(host=""):
+    with _junk_lock:
+        helper = _junk_helpers.get(host)
+        return [dict(n) for n in helper.cache] if helper else []
+
+
+def _junk_result(host, result):
+    with _junk_lock:
+        if result.get("ok") is True:
+            _junk_errors.pop(host, None)
+        else:
+            error = str(result.get("error", "junk operation not acknowledged"))
+            if _junk_errors.get(host) != error:
+                print(f"junk Hunt {host or 'local'}: {error}", file=sys.stderr, flush=True)
+            _junk_errors[host] = error
+    return result
+
+
+def _close_junk_helper(host, helper):
+    """Never replace a disconnected session before its revocation is acknowledged."""
+    result = _junk_result(host, helper.close())
+    if result["ok"]:
+        with _junk_lock:
+            if _junk_helpers.get(host) is helper:
+                del _junk_helpers[host]
+    return result
+
+
+def _cleanup_junk(remote_only=False):
+    with _junk_lock:
+        _junk_generation[0] += 1  # invalidate registered and in-flight producers
+        helpers = [(h, p) for h, p in _junk_helpers.items() if h or not remote_only]
+    errors = []
+    for host, helper in helpers:
+        result = _close_junk_helper(host, helper)
+        if not result["ok"]:
+            errors.append(f"{host or 'local'}: {result['error']} (lease cleanup pending)")
+    return errors
+
+
+def _tend_junk(host="", create=False):
+    with _junk_lock:
+        if not _junk_enabled(host):
+            return
+        generation = _junk_generation[0]
+        helper = _junk_helpers.get(host)
+        if helper is None:
+            if not create:
+                return
+            if host and (host not in ssh_hosts() or host.startswith("-")
+                         or any(c.isspace() for c in host)):
+                return
+            if host and sum(bool(h) for h in _junk_helpers) >= JUNK_REMOTE_HOST_CAP:
+                return
+            executor = (lambda cmd, timeout: _ssh_run(host, cmd, timeout=timeout)) if host else None
+            helper = junk_hunt.Helper(executor=executor)
+            _junk_helpers[host] = helper  # register BEFORE any slow spawn
+    with helper.lock:
+        if not _junk_enabled(host) or generation != _junk_generation[0]:
+            return
+        if helper.closed:
+            _close_junk_helper(host, helper)
+            return
+        if not getattr(helper, "started", False):
+            result = _junk_result(host, helper.start())
+            if not result["ok"]:
+                # A timed-out bootstrap may finish after SSH disconnects.
+                # Revoke that exact session; never replace it blindly.
+                _close_junk_helper(host, helper)
+                return
+            helper.started = True
+        if not _junk_enabled(host) or generation != _junk_generation[0]:
+            return
+        cap = min(REMOTE_ENEMY_CAP if host else ENEMY_CAP // 2, junk_hunt.MAX_NESTS)
+        create = create and len(helper.cache) < cap
+        result = helper.tick(create=create, directory=bool(len(helper.cache) % 2))
+        _junk_result(host, result)
+        if not result["ok"]:
+            _close_junk_helper(host, helper)
+
+
+def _pause_hunt():
+    with _junk_lock:
+        _junk_generation[0] += 1
+        helper = _junk_helpers.get("")
+    errors = []
+    if helper:
+        result = _junk_result("", helper.pause())
+        if not result["ok"]:
+            errors.append(result["error"])
+    # Remote SIM uses revocation rather than pause, fencing late SSH starts.
+    errors.extend(_cleanup_junk(remote_only=True))
+    _kill_all_enemies(preserve_junk=True)
+    return errors
+
+
+def _resume_junk():
+    with _junk_lock:
+        helper = _junk_helpers.get("")
+    if helper and _junk_enabled():
+        result = _junk_result("", helper.resume())
+        if not result["ok"]:
+            # A long SIM can outlive the independent lease. Retire the exact
+            # old session before allowing a fresh helper on the next Hunt tick.
+            result = _close_junk_helper("", helper)
+        return result
+    return {"ok": True}
+
+
+def _set_enemy_level(level):
+    with _hunt_transition_lock:
+        with _junk_lock:
+            ENEMY_LEVEL[0] = max(0, min(2, int(level)))
+        if ENEMY_LEVEL[0] == 0:
+            errors = _kill_all_enemies()
+        elif ENEMY_LEVEL[0] == 1:
+            errors = _cleanup_junk(remote_only=True)
+            if REMOTE_ENEMIES:
+                _purge_remote_enemies()
+        else:
+            errors = []
+        return {"ok": not errors, "enemies": ENEMY_LEVEL[0],
+                **({"error": "; ".join(errors)} if errors else {})}
+
+
+def junk_action(req, host=""):
+    if not _junk_enabled(host):
+        return {"ok": False, "error": "SIM, shutdown, or Hunt tier blocks junk_rm"}
+    if req.get("confirm") is not True:
+        return {"ok": False, "error": "junk_rm requires confirm=true"}
+    ident = req.get("id")
+    if not isinstance(ident, str) or not junk_hunt.ID_RE.fullmatch(ident):
+        return {"ok": False, "error": "invalid nest ID"}
+    with _junk_lock:
+        helper = _junk_helpers.get(host)
+    if helper is None or not any(n["id"] == ident for n in helper.cache):
+        return {"ok": False, "error": "unknown nest ID in requested host namespace"}
+    with helper.lock:
+        if not _junk_enabled(host):
+            return {"ok": False, "error": "Hunt is disabled"}
+        return _junk_result(host, helper.erase(ident))
+
+
+def _junk_signal(pid, sig, host=""):
+    with _junk_lock:
+        helper = _junk_helpers.get(host)
+    if helper:
+        for nest in helper.cache:
+            if nest["pid"] == pid:
+                if not _junk_enabled(host):
+                    return {"ok": False, "error": "Hunt is disabled"}
+                return _junk_result(host, helper.signal_writer(nest["id"], sig, pid=pid))
+    return None
+
+
+def _mark_junk_entries(listing, host=""):
+    records = {n["name"]: n for n in _junk_snapshot(host) if n["parent"] == listing["path"]}
+    for entry in listing["entries"]:
+        if entry["name"] in records:
+            record = records[entry["name"]]
+            entry.update(junk_id=record["id"], junk_state=record["state"])
+    return listing
 
 
 def _remote_burn_cmd(ttl: float, hog_mb: int) -> str:
@@ -103,22 +279,13 @@ def _tend_remote_host(host: str):
 
 
 def _spawn_remote_enemies():
-    """Best-effort: drop a rogue on each open host that lacks one. Never blocks long."""
-    status = ssh_probe_status()
-    for host, st in status.items():
-        if st != "open":
-            continue
-        _tend_remote_host(host)
-        have = {p: t for p, t in REMOTE_ENEMIES.get(host, {}).items()
-                if time.time() - t < ENEMY_TTL + 30}
-        if len(have) >= REMOTE_ENEMY_CAP:
-            REMOTE_ENEMIES[host] = have
-            continue
-        hog_mb = random.randint(100, 400)
-        rc, out, _err = _ssh_run(host, _remote_burn_cmd(ENEMY_TTL, hog_mb), timeout=10)
-        if rc == 0 and out.strip().isdigit():
-            have[int(out.strip())] = time.time()
-            REMOTE_ENEMIES[host] = have
+    """Only owned, independently leased writers on at most four opted-in hosts."""
+    if not _junk_enabled("remote"):
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    hosts = sorted(h for h, state in ssh_probe_status().items() if state == "open")[:JUNK_REMOTE_HOST_CAP]
+    with ThreadPoolExecutor(max_workers=JUNK_REMOTE_HOST_CAP) as pool:
+        list(pool.map(lambda host: _tend_junk(host, create=True), hosts))
 
 
 def _purge_remote_enemies():
@@ -165,7 +332,8 @@ def _spawn_enemy():
     return p.pid
 
 
-def _kill_all_enemies():
+def _kill_all_enemies(preserve_junk=False):
+    errors = [] if preserve_junk else _cleanup_junk()
     for pid, e in list(ENEMIES.items()):
         try:
             e["proc"].kill()
@@ -177,17 +345,21 @@ def _kill_all_enemies():
             _purge_remote_enemies()
         except Exception:
             pass  # best effort on shutdown
+    return errors
 
 
 def _tend_enemies():
     """Reap dead, punish freezes, keep the world at population (per level)."""
     now = time.time()
+    if _shutdown_started.is_set() or sim_active():
+        return  # sim_next() can return None between replay ticks
     if ENEMY_LEVEL[0] == 0:
-        if ENEMIES:
+        if ENEMIES or _junk_helpers:
             _kill_all_enemies()
         if REMOTE_ENEMIES:
             _purge_remote_enemies()
         return
+    _tend_junk()
     for pid in list(ENEMIES.keys()):
         e = ENEMIES[pid]
         if e["proc"].poll() is not None:
@@ -206,10 +378,14 @@ def _tend_enemies():
                 e["frozen_since"] = None
         else:
             e["frozen_since"] = None
-    if len(ENEMIES) < ENEMY_CAP and now - _last_spawn[0] > ENEMY_SPAWN_SECS:
+    junk_count = len(_junk_snapshot())  # reserve slots even while respawning
+    if len(ENEMIES) + junk_count < ENEMY_CAP and now - _last_spawn[0] > ENEMY_SPAWN_SECS:
         _last_spawn[0] = now
         try:
-            _spawn_enemy()
+            if junk_count < min(junk_hunt.MAX_NESTS, ENEMY_CAP // 2):
+                _tend_junk(create=True)
+            elif _junk_enabled():
+                _spawn_enemy()
         except OSError:
             pass
     if ENEMY_LEVEL[0] >= 2 and now - _last_remote_spawn[0] > ENEMY_SPAWN_SECS:
@@ -459,10 +635,12 @@ def sim_control(req: dict) -> dict:
         _sim["playing"] = True
         _sim["idx"] = int(req.get("idx", len(buf) - 1)) % len(buf)
         _sim["name"] = str(req.get("name", "live-window"))
-        return {"ok": True, "sim": sim_state()}
+        errors = _pause_hunt()
+        return {"ok": not errors, "sim": sim_state(),
+                **({"error": "; ".join(errors)} if errors else {})}
     if op == "stop":
         _sim["playing"] = False
-        return {"ok": True, "sim": sim_state()}
+        return {**_resume_junk(), "sim": sim_state()}
     if op == "speed":
         _sim["speed"] = max(0.25, min(8.0, float(req.get("speed", 1.0))))
         return {"ok": True, "sim": sim_state()}
@@ -506,7 +684,9 @@ def sim_control(req: dict) -> dict:
         _sim["playing"] = True
         _sim["idx"] = 0
         _sim["name"] = name
-        return {"ok": True, "sim": sim_state()}
+        errors = _pause_hunt()
+        return {"ok": not errors, "sim": sim_state(),
+                **({"error": "; ".join(errors)} if errors else {})}
     if op == "list":
         try:
             os.makedirs(SIM_DIR, exist_ok=True)
@@ -567,7 +747,11 @@ _REMOTE_WORLD = (
 def remote_world(host: str) -> dict:
     rc, out, err = _ssh_run(host, _REMOTE_WORLD)
     if rc != 0:
-        return {"error": err or f"ssh exit {rc}"}
+        return {"error": err or f"ssh exit {rc}", "junk": []}
+    with _junk_lock:
+        helper = _junk_helpers.get(host)
+    if helper and not helper.closed:
+        _junk_result(host, helper.snapshot())
     procs, load, mem, rhost = [], [0, 0, 0], (0, 0), host
     for line in out.splitlines():
         line = line.strip()
@@ -597,7 +781,10 @@ def remote_world(host: str) -> dict:
         "mem": {"total": total, "available": avail,
                 "percent": round(100.0 * (total - avail) / max(total, 1), 1)},
         "procs": procs,
-        "enemies": sorted(REMOTE_ENEMIES.get(host, {}).keys()),
+        "enemies": sorted(set(REMOTE_ENEMIES.get(host, {})) |
+                          {n["pid"] for n in _junk_snapshot(host) if n["pid"] > 0}),
+        "junk": _junk_snapshot(host),
+        "junk_error": _junk_errors.get(host),
     }
 
 
@@ -633,17 +820,23 @@ def remote_list(host: str, path: str) -> dict:
         })
     entries.sort(key=lambda x: (not x["dir"], -x["size"]))
     parent = os.path.dirname(path.rstrip("/")) or "/"
-    return {"path": path, "parent": parent, "entries": entries, "truncated": False}
+    return _mark_junk_entries(
+        {"path": path, "parent": parent, "entries": entries, "truncated": False}, host)
 
 
 def remote_action(host: str, req: dict) -> dict:
     """Fixed verbs only: kill(pid,sig) and rm(path) on the remote."""
     import shlex
     verb = req.get("verb")
+    if verb == "junk_rm":
+        return junk_action(req, host)
     if verb == "kill":
         pid, sig = int(req.get("pid", -1)), int(req.get("sig", 0))
         if sig not in (19, 18, 9) or pid < 1:
             return {"ok": False, "error": "bad kill args"}
+        owned = _junk_signal(pid, sig, host)
+        if owned is not None:
+            return owned
         rc, out, err = _ssh_run(host, f"kill -{sig} {pid} 2>&1; echo RC:$?")
         ok = "RC:0" in out
         return {"ok": ok, "syscall": f"ssh {host} kill({pid},{sig})",
@@ -694,12 +887,12 @@ def gather_listing(path: str) -> dict:
             except OSError:
                 continue
     entries.sort(key=lambda x: (not x["dir"], -x["size"]))
-    return {
+    return _mark_junk_entries({
         "path": path,
         "parent": os.path.dirname(path) or "/",
         "entries": entries[:400],
         "truncated": len(entries) > 400,
-    }
+    })
 
 
 def protected_paths() -> set:
@@ -760,7 +953,9 @@ def gather_world(tick: int) -> dict:
         "hw": gather_hardware(),
         "procs": gather_processes(),
         "net": gather_net(),
-        "enemies": sorted(ENEMIES.keys()),
+        "enemies": sorted(set(ENEMIES) | {n["pid"] for n in _junk_snapshot() if n["pid"] > 0}),
+        "junk": _junk_snapshot(),
+        "junk_errors": dict(_junk_errors),
         "enemies_level": ENEMY_LEVEL[0],
         "remote_enemies": {h: sorted(p.keys()) for h, p in dict(REMOTE_ENEMIES).items()},
         "ssh": {"hosts": ssh_hosts(), "status": ssh_probe_status()},
@@ -808,16 +1003,12 @@ class _Handler(BaseHTTPRequestHandler):
                 body = json.dumps({"ok": False, "error": "SIM MODE: verbs are frozen. stop the sim first (M)"}).encode()
             elif verb == "enemies":
                 if "level" in req:
-                    ENEMY_LEVEL[0] = max(0, min(2, int(req["level"])))
+                    level = req["level"]
                 else:
-                    ENEMY_LEVEL[0] = 1 if req.get("on") else 0
-                if ENEMY_LEVEL[0] == 0:
-                    _kill_all_enemies()
-                    _purge_remote_enemies()
-                elif ENEMY_LEVEL[0] == 1 and REMOTE_ENEMIES:
-                    _purge_remote_enemies()
-                body = json.dumps({"ok": True,
-                                   "enemies": ENEMY_LEVEL[0]}).encode()
+                    level = 1 if req.get("on") else 0
+                body = json.dumps(_set_enemy_level(level)).encode()
+            elif verb == "junk_rm":
+                body = json.dumps(junk_action(req, str(host) if host else "")).encode()
             elif host:
                 body = json.dumps(remote_action(str(host), req)).encode()
             elif verb == "rm":
@@ -855,6 +1046,9 @@ class _Handler(BaseHTTPRequestHandler):
             raise ValueError("verb must be 'kill', sig must be 19/18/9")
         if pid in _Handler._protected():
             raise ValueError(f"pid {pid} is protected")
+        owned = _junk_signal(pid, sig)
+        if owned is not None:
+            return json.dumps(owned).encode()
         if sig == 9:
             # remember the victim's name so a respawn can be flagged as hydra
             try:
@@ -1001,7 +1195,8 @@ def _poller():
                 _Handler.blob = json.dumps(
                     replay, separators=(",", ":")).encode()
             else:
-                _tend_enemies()
+                if not sim_active():
+                    _tend_enemies()
                 snap = gather_world(tick)
                 sim_record(snap)
                 snap["sim"] = sim_state()

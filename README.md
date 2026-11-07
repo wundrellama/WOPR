@@ -40,6 +40,8 @@ not live machine data; the captures execute no real system actions.
 | ![WOPR opening console](docs/screenshots/opening.png) | ![Fixture process city and telemetry HUD](docs/screenshots/world.png) |
 | File-vault interior | SSH link transition |
 | ![Isolated amber file vault](docs/screenshots/vault.png) | ![Cyan SSH tunnel awaiting a remote snapshot](docs/screenshots/ssh-transit.png) |
+| Vault destination beacons | Junk nests inside a vault |
+| ![Pink ring beacons guide you to the affected vault](docs/screenshots/junk-vault-beacons.png) | ![Marked junk links among ordinary vault entries](docs/screenshots/junk-vault.png) |
 
 ![Hunt fixture with red rogue processes and PID/range locators](docs/screenshots/hunt.png)
 
@@ -111,16 +113,12 @@ acknowledged remote host.
 
 ### Hunt visibility
 
-Hunt targets render as pulsing red process towers on the CPU plains, with
+Hunt targets render as pulsing red process towers across the field, with
 readable `ROGUE / PID` labels. Screen-space brackets show their PID and range;
 edge arrows marked `BEHIND` keep off-screen rogues findable without selecting or
 firing at them. Local and remote hunt markers use their own PID namespaces and
 do not leak into file vaults. Target lock and signals remain deliberate player
 actions: aim, left-click to lock, then F/C/K.
-
-Enemy IDs are normalized once after JSON parsing so Godot's float-valued JSON
-numbers match integer process identities. Spawn behavior and daemon safety
-rules are unchanged; these are rendering/recognition changes, not fake enemies.
 
 ### Safe visual verification
 
@@ -150,7 +148,7 @@ sequences. It does **not** exercise real signals, file deletion, SSH, or sudo.
 Presentation code: `game/scripts/console_ui.gd`, `flight_overlay.gd`,
 `travel_overlay.gd`, `action_effects.gd`, `world_art.gd`, and `game/shaders/`.
 Navigation and action orchestration remain in `main.gd`; telemetry and
-privileged daemon code are unchanged.
+privileged action policies are unchanged by the presentation layer.
 
 ## Controls
 
@@ -162,8 +160,8 @@ privileged daemon code are unchanged.
 | `F` | freeze | `kill(pid, SIGSTOP)` — real |
 | `C` | resume | `kill(pid, SIGCONT)` — real |
 | `K` | smite | `kill(pid, SIGKILL)` — real |
-| `H` | hunt: cycle off / local / +remote rogues | spawns real burner processes |
-| `Enter` | descend vault / travel gate | — |
+| `H` | hunt: cycle off / local / +remote rogues | spawns real burners and junk writers |
+| `Enter` | descend vault / travel gate / follow junk marker | — |
 | `V` | browse remote files (in a remote world) | — |
 | Hold-`X` | erase (in a vault) | `rm -rf` — real, guarded (as root when armed) |
 | `Y` | arm the Kernel Oracle | sudo ritual · root verbs for 120s |
@@ -202,12 +200,31 @@ actions, path arguments only. Zero Rust dependencies, ~450 auditable lines
 
 ## Enemies
 
-The daemon spawns real CPU-burner + RAM-hoarder child processes (nice'd to
-19, TTL 180s, cap 4). They roam the plains as red ROGUE monoliths. Kill them
-with K before they expire or you "let one go free". Freezing one only
-buys 8 seconds — rogues break out of SIGSTOP. Because they wander among your
-real processes, an errant smite can kill something that matters. That's the
-game.
+Press **H** to enable local hunting. Press it again to include reachable SSH
+hosts, or once more to turn hunting off. Red ROGUE towers are real processes.
+Ordinary rogues burn CPU and hold RAM. Freezing one buys only 8 seconds.
+Rogues roam across the field. They enter the network and SSH area only when
+local-plus-remote hunting is enabled. Roaming does not trigger travel.
+
+Some rogues write junk and leave a nest that lets them respawn after you kill
+them. Pink outdoor markers guide you to the affected **vault**. The actual
+**JUNK / NEST** files appear inside that vault, beside ordinary files.
+Killing the writer does not remove its nest.
+
+1. Kill the rogue with **K**, or leave it running while you find its nest.
+2. Follow the pink vault indicator and press **Enter** at its beacon to open the affected folder.
+3. Find the marked entry and hold **X** to erase it and disable that nest's respawn.
+
+The marked entries are symlinks among real files in random existing folders
+under that host's home. Their backing junk stays in WOPR's private session
+storage. **Deleting a neighboring real file is still a real deletion.**
+
+Turning Hunt off or closing the game removes its junk links and backing data.
+Remote junk requires the local-plus-remote Hunt tier. If SSH cleanup fails,
+the remote helper's expiry lease supplies a fallback and the failure is reported.
+SIM stops junk writers and prevents real erasure.
+
+Developer commands and lifecycle details are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Roadmap
 

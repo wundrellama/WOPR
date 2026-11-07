@@ -14,7 +14,7 @@ import sys
 
 
 PROJECT = Path(__file__).resolve().parents[1]
-VIEWS = ("title", "world", "hunt", "hunt-behind", "target", "remote", "vault", "sim", "armed", "ritual", "farewell")
+VIEWS = ("title", "world", "hunt", "hunt-behind", "junk", "junk-vault", "remote-junk", "target", "remote", "vault", "sim", "armed", "ritual", "farewell")
 ERROR = re.compile(r"(?:SCRIPT ERROR|SHADER ERROR|^ERROR:|Parse Error|Assertion failed)", re.MULTILINE)
 
 
@@ -38,7 +38,7 @@ def main():
                "scripts/console_ui.gd", "scripts/travel_overlay.gd", "scripts/action_effects.gd",
                "tests/visual_smoke.gd", "tests/navigation_regression.gd", "tests/travel_test.gd",
                "tests/action_feedback_test.gd", "tests/presentation_sequence.gd", "tests/daemon_probe_test.gd",
-               "tests/hunt_render_test.gd")
+               "tests/hunt_render_test.gd", "tests/junk_hunt_test.gd", "tests/rogue_roaming_test.gd")
     for script in scripts:
         run(["godot", "--headless", "--path", str(PROJECT), "--check-only", "--script", script])
     print(f"PASS: {len(scripts)} GDScript parse checks", flush=True)
@@ -47,6 +47,8 @@ def main():
              "tests/visual_smoke.gd", "--", f"--view={view}"], f"VISUAL_SMOKE_OK view={view}")
         print(f"PASS: headless runtime / {view}", flush=True)
     for script, marker in (("hunt_render_test.gd", "HUNT_RENDER_OK"),
+                           ("junk_hunt_test.gd", "JUNK_HUNT_OK"),
+                           ("rogue_roaming_test.gd", "ROGUE_ROAMING_OK"),
                            ("daemon_probe_test.gd", "DAEMON_PROBE_OK"),
                            ("navigation_regression.gd", "NAVIGATION_REGRESSION_OK"),
                            ("travel_test.gd", "TRAVEL_TEST_OK"),

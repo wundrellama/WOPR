@@ -78,6 +78,16 @@ var sim_info := {}                 # full sim state for the HUD
 var daemon_pid := -1               # daemon we spawned ourselves (-1 = adopted)
 var rogue_tags: Dictionary = {}    # pid -> Label3D floating over a ROGUE
 var local_rogues: Dictionary = {}   # canonical integer PIDs, never raw JSON membership
+var local_junk: Dictionary = {}     # opaque ID -> authoritative record (local namespace)
+var remote_junk: Dictionary = {}    # opaque ID -> record for remote_junk_host only
+var local_junk_bodies: Dictionary = {}
+var remote_junk_bodies: Dictionary = {}
+var remote_junk_host := ""
+var hover_junk_id := ""
+var pending_junk: Dictionary = {}
+var rogue_clock := 0.0
+var remote_roam_host := ""
+const JUNK_COLOR := Color("ff65c5")
 var roads: Dictionary = {}         # ip -> {start, end, mat, packets}
 var kernel_ring_rot := 0.0
 var water_y := 6.0
@@ -469,6 +479,7 @@ func _on_world(_result: int, code: int, _headers: PackedStringArray, body: Packe
 		_build_geography()
 		built_geo = true
 	_sync_procs()
+	_sync_junk(world.get("junk", []), "")
 	_update_geo()
 	_update_hud()
 
@@ -709,18 +720,40 @@ func _update_ssh_gates() -> void:
 
 # ---------------------------------------------------------------- processes
 
+func _rogue_roam_pos(pid: int, elapsed: float, allow_network: bool) -> Vector3:
+	# A closed field tour, with eased turns and speed below the player's walk.
+	# The west/network leg is a presentation opt-in, never an SSH action.
+	var route: Array[Vector3] = [Vector3.ZERO, Vector3(0, 0, 950),
+		Vector3(1100, 0, 450), Vector3(1100, 0, -400), Vector3(0, 0, -950),
+		Vector3.ZERO, Vector3(-1150 if allow_network else -250, 0, 0), Vector3.ZERO]
+	var length := 0.0
+	for i in range(route.size() - 1):
+		length += route[i].distance_to(route[i + 1])
+	var distance := fposmod(elapsed * 18.0 + float(posmod(pid * 37, 4093)), length)
+	for i in range(route.size() - 1):
+		var leg := route[i].distance_to(route[i + 1])
+		if distance <= leg:
+			var fraction := distance / leg
+			return route[i].lerp(route[i + 1], fraction * fraction * (3.0 - 2.0 * fraction))
+		distance -= leg
+	return Vector3.ZERO
+
+
+func _move_rogue(body: Node3D, pid: int, delta: float) -> void:
+	var goal := _rogue_roam_pos(pid, rogue_clock, int(world.get("enemies_level", 0)) >= 2)
+	body.position = body.position.move_toward(Vector3(goal.x, body.position.y, goal.z), maxf(delta, 0.0) * 30.0)
+	if int(world.get("enemies_level", 0)) < 2:
+		body.position.x = maxf(-300, body.position.x)
+
+
 func _district_pos(p: Dictionary) -> Vector3:
 	var pid: int = p["pid"]
 	var h1 := (pid * 2654435761) % 4093
 	var h2 := (pid * 40503) % 4099
 	if local_rogues.has(pid):
-		# rogues roam the CPU plains: hash anchor + slow lissajous drift per tick
-		var t := float(world.get("tick", 0))
-		var ph := float(h1 % 628) / 100.0
-		var ax := float(h1 % 500) - 250.0
-		var az := PLAINS_Z - 200.0 + float(h2 % 300) - 150.0
-		return Vector3(ax + sin(t * 0.35 + ph) * 120.0, 0,
-			az + cos(t * 0.27 + ph * 1.7) * 90.0)
+		if str(p.get("state", "")) == "T" and monoliths.has(pid):
+			return monoliths[pid].position
+		return _rogue_roam_pos(pid, rogue_clock, int(world.get("enemies_level", 0)) >= 2)
 	if pid == 1:
 		return Vector3.ZERO
 	if p["ppid"] == 2 or (p["ppid"] == 1 and str(p["name"]).begins_with("[")):
@@ -853,7 +886,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		return
 	if actions_need_release or (event is InputEventKey and event.echo):
 		return
-	if not pending_shot.is_empty() and event is InputEventKey and event.keycode in [KEY_F, KEY_C, KEY_K, KEY_Y, KEY_M, KEY_H, KEY_ENTER, KEY_KP_ENTER]:
+	if (not pending_shot.is_empty() or not pending_junk.is_empty()) and event is InputEventKey and event.keycode in [KEY_F, KEY_C, KEY_K, KEY_Y, KEY_M, KEY_H, KEY_ENTER, KEY_KP_ENTER]:
 		return
 	if arm_screen != null:
 		# the ritual screen owns all input while open
@@ -894,6 +927,10 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_ENTER, KEY_KP_ENTER:
 				if mode == "vault":
 					_vault_open_hovered()
+				elif hover_junk_id != "":
+					var known := remote_junk if mode == "remote" else local_junk
+					if known.has(hover_junk_id):
+						_enter_vault(str(known[hover_junk_id].parent), remote_host if mode == "remote" else "")
 				elif mode == "world" and hover_ssh_host != "":
 					_travel_to(hover_ssh_host)
 				elif mode == "world" and hover_mount_path != "":
@@ -948,6 +985,132 @@ func _hunt_targets() -> Dictionary:
 	return result
 
 
+func _junk_vault_anchor(record: Dictionary, host: String) -> Vector3:
+	var anchor := Vector3(VAULTS_X, 35, 0)
+	if host != "":
+		return anchor
+	var parent := str(record.get("parent", ""))
+	var longest := -1
+	for candidate in pickables:
+		if not is_instance_valid(candidate):
+			continue
+		var info: Dictionary = pickables[candidate]
+		if info.get("kind") != "mount":
+			continue
+		var path := str(info.mnt.path).trim_suffix("/")
+		if (path == "" or parent == path or parent.begins_with(path + "/")) and path.length() > longest:
+			longest = path.length()
+			anchor = candidate.position
+	return anchor
+
+
+func _sync_junk(records: Array, host: String) -> void:
+	var known := local_junk if host == "" else remote_junk
+	var bodies := local_junk_bodies if host == "" else remote_junk_bodies
+	var root_node := world_root if host == "" else remote_root
+	if host != "" and remote_junk_host != host:
+		for body: StaticBody3D in bodies.values():
+			pickables.erase(body)
+			body.collision_layer = 0
+			body.queue_free()
+		bodies.clear()
+		remote_junk_host = host
+	known.clear()
+	for value in records:
+		if not value is Dictionary or str(value.get("id", "")) == "" or not str(value.get("path", "")).begins_with("/"):
+			continue
+		var record: Dictionary = value.duplicate(true)
+		var id := str(record.id)
+		record.pid = int(record.get("pid", 0))
+		record.respawns = int(record.get("respawns", 0))
+		known[id] = record
+		if not bodies.has(id):
+			var body := StaticBody3D.new()
+			body.collision_layer = 1 if host == "" else 4
+			root_node.add_child(body)
+			var occupied_slots := {}
+			for existing: StaticBody3D in bodies.values():
+				occupied_slots[int(existing.get_meta("junk_slot"))] = true
+			var index := 0
+			while occupied_slots.has(index): index += 1
+			body.set_meta("junk_slot", index)
+			var mesh := MeshInstance3D.new()
+			var ring := TorusMesh.new()
+			ring.inner_radius = 11
+			ring.outer_radius = 16
+			mesh.mesh = ring
+			mesh.rotation.x = PI * 0.5
+			mesh.material_override = Art.material(JUNK_COLOR, 0.7)
+			body.add_child(mesh)
+			var collision := CollisionShape3D.new()
+			var shape := BoxShape3D.new()
+			shape.size = Vector3(36, 36, 10)
+			collision.shape = shape
+			body.add_child(collision)
+			var label := Label3D.new()
+			label.name = "VaultBeaconLabel"
+			label.font_size = 64
+			label.pixel_size = 0.14
+			label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+			label.outline_size = 10
+			label.modulate = JUNK_COLOR
+			label.position.y = 38
+			body.add_child(label)
+			body.set_meta("junk_vault_beacon", true)
+			bodies[id] = body
+		var body: StaticBody3D = bodies[id]
+		var slot: int = body.get_meta("junk_slot")
+		body.position = _junk_vault_anchor(record, host) + Vector3(60 + slot * 100, 40, slot * 90)
+		body.set_meta("junk", record)
+		body.set_meta("junk_host", host)
+		pickables[body] = {"kind": "junk", "id": id, "host": host}
+		var label: Label3D = body.get_node("VaultBeaconLabel")
+		label.position.y = 38 + slot * 45
+		label.text = "VAULT / %s\n%s" % [host if host != "" else "LOCAL", str(record.get("parent", ""))]
+	for id in bodies.keys():
+		if not known.has(id):
+			var body: StaticBody3D = bodies[id]
+			pickables.erase(body)
+			body.collision_layer = 0
+			body.queue_free()
+			bodies.erase(id)
+	if mode == "vault" and vault_host == host:
+		_sync_vault_junk()
+
+
+func _decorate_junk(body: StaticBody3D, record: Dictionary, dimensions: Vector3, vault: bool = false) -> void:
+	# Folder tab / file page-stripes distinguish artifacts from process towers.
+	for i in (1 if bool(record.get("dir", false)) else 3):
+		var accent := MeshInstance3D.new()
+		var box := BoxMesh.new()
+		box.size = Vector3(dimensions.x * 0.65, 3, dimensions.z * 1.15)
+		accent.mesh = box
+		accent.material_override = Art.material(JUNK_COLOR, 0.8)
+		accent.position = Vector3(-dimensions.x * 0.12, dimensions.y * 0.5 - float(i) * 6.0, 0)
+		body.add_child(accent)
+	var label := Label3D.new()
+	label.name = "JunkLabel"
+	label.font_size = 64
+	label.pixel_size = 0.075 if vault else 0.14
+	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	label.outline_size = 10
+	label.outline_modulate = Color(0, 0, 0, 0.95)
+	label.modulate = JUNK_COLOR
+	label.position.y = dimensions.y * 0.5 + (10 if vault else 22)
+	label.text = "JUNK LINK\nNEST %s\n%s" % ["FOLDER" if bool(record.get("dir", false)) else "FILE", crosshair.junk_display_name(str(record.get("name", "")))]
+	body.add_child(label)
+
+
+func _junk_targets() -> Dictionary:
+	if mode == "vault":
+		var result := {}
+		for body: StaticBody3D in vault_bodies:
+			if body.has_meta("junk"):
+				result[str(body.get_meta("junk").id)] = body
+		return result
+	return remote_junk_bodies if mode == "remote" else local_junk_bodies
+
+
 func _process(delta: float) -> void:
 	_advance_travel(delta)
 	if actions_need_release and not _action_key_held():
@@ -969,6 +1132,7 @@ func _process(delta: float) -> void:
 	hover_label.size.x = viewport_size.x - 128.0
 	crosshair.target = remote_monoliths.get(selected_pid) if mode == "remote" else monoliths.get(selected_pid)
 	crosshair.hunt_targets = _hunt_targets()
+	crosshair.junk_targets = _junk_targets()
 	if travel_state != "idle" or actions_need_release or arm_screen != null or splash != null or farewell != null:
 		erase_hold_start = -1.0
 	elif mode == "vault":
@@ -987,6 +1151,8 @@ func _process(delta: float) -> void:
 	else:
 		_update_hover()
 	# living world: glide monoliths toward their targets every frame
+	if not sim_playing:
+		rogue_clock += maxf(delta, 0.0)
 	kernel_ring_rot += delta * 0.05
 	water.position.y = lerpf(water.position.y, water_y, clampf(delta * 0.7, 0.0, 1.0))
 	var now := Time.get_ticks_msec() / 1000.0
@@ -994,18 +1160,34 @@ func _process(delta: float) -> void:
 		var body3d: StaticBody3D = monoliths[pid]
 		if not targets.has(pid):
 			continue
-		body3d.position = body3d.position.lerp(targets[pid], clampf(delta * 2.5, 0.0, 1.0))
-		if rogue_tags.has(pid):
+		var p = _proc(pid)
+		var frozen: bool = p != null and str(p.get("state", "")) == "T"
+		if local_rogues.has(pid):
+			if not frozen:
+				_move_rogue(body3d, pid, delta)
+				body3d.position.y = targets[pid].y
+		else:
+			body3d.position = body3d.position.lerp(targets[pid], clampf(delta * 2.5, 0.0, 1.0))
+		if rogue_tags.has(pid) and not frozen:
 			# heartbeat pulse on the ROGUE monolith + tag
 			var pulse := 0.5 + 0.5 * sin(now * 5.0)
 			var rmat: StandardMaterial3D = body3d.get_child(0).material_override
 			Art.update_material(rmat, Color(1.0, 0.22, 0.15), 0.4 + pulse)
 			(rogue_tags[pid] as Label3D).modulate = Color(1.0, 0.15 + pulse * 0.4, 0.15)
 			rogue_tags[pid].position = body3d.position + Vector3(0, body3d.get_child(1).shape.size.y * 0.5 + 14.0, 0)
-		var p = _proc(pid)
 		if p != null and p["state"] != "T":
 			var cpu: float = clampf(float(p["cpu"]) / 100.0, 0.0, 1.0)
 			body3d.position.y += sin(now * 3.0 + bob_phase[pid]) * (0.3 + cpu * 2.5) * 0.5
+	for pid in remote_rogues:
+		if not remote_monoliths.has(pid):
+			continue
+		var p = _remote_proc(pid)
+		var body: Node3D = remote_monoliths[pid]
+		if p != null and str(p.get("state", "")) != "T":
+			_move_rogue(body, pid, delta)
+		var tag: Variant = body.get_meta("rogue_tag", null)
+		if is_instance_valid(tag):
+			tag.position = body.position + Vector3(0, body.get_child(1).shape.size.y * 0.5 + 16, 0)
 	# light-road traffic
 	for key in roads:
 		var rd: Dictionary = roads[key]
@@ -1037,6 +1219,7 @@ func _hover_ray() -> Dictionary:
 
 func _update_hover() -> void:
 	hover_pid = -1
+	hover_junk_id = ""
 	hover_mount_path = ""
 	hover_ssh_host = ""
 	var hit := _hover_ray()
@@ -1045,6 +1228,8 @@ func _update_hover() -> void:
 		return
 	var info: Dictionary = hit["info"]
 	match info.get("kind", ""):
+		"junk":
+			_show_junk_hover(info)
 		"proc":
 			hover_pid = int(info["pid"])
 			var p: Variant = _proc(hover_pid)
@@ -1097,6 +1282,19 @@ func _update_hover() -> void:
 			hover_label.text = "GATEWAY '%s'  ·  %s  ·  %s" % [hover_ssh_host, st, hint]
 
 
+func _show_junk_hover(info: Dictionary) -> void:
+	var host := remote_host if mode == "remote" else ""
+	var known := remote_junk if mode == "remote" else local_junk
+	var id := str(info.get("id", ""))
+	if str(info.get("host", "")) != host or not known.has(id):
+		return
+	hover_junk_id = id
+	var record: Dictionary = known[id]
+	hover_label.add_theme_color_override("font_color", JUNK_COLOR)
+	hover_label.position.y = get_viewport().get_visible_rect().size.y * 0.58
+	hover_label.text = "VAULT / JUNK NEST @ %s · %s\n%s\nEnter: open affected folder · find marked junk inside · ordinary neighbors are REAL FILES" % [host if host != "" else "LOCAL", str(record.get("state", "dormant")), str(record.get("parent", ""))]
+
+
 func _pick() -> void:
 	if travel_state != "idle" or actions_need_release or not pending_shot.is_empty():
 		return
@@ -1145,7 +1343,7 @@ func _action_key_held() -> bool:
 func _begin_travel(kind: String, destination: String, operation: String) -> bool:
 	if travel_state != "idle" or splash != null or farewell != null or arm_screen != null:
 		return false
-	if not pending_shot.is_empty() or action_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
+	if not pending_shot.is_empty() or not pending_junk.is_empty() or action_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
 		last_action = "wait for the current action result before traveling"
 		return false
 	if is_instance_valid(action_effects):
@@ -1223,6 +1421,7 @@ func _activate_world(next_mode: String) -> void:
 	if is_instance_valid(action_effects):
 		action_effects.clear()
 	hover_pid = -1
+	hover_junk_id = ""
 	hover_mount_path = ""
 	hover_ssh_host = ""
 	erase_hold_start = -1.0
@@ -1303,7 +1502,7 @@ func _finish_travel() -> void:
 	hud.visible = splash == null and farewell == null and arm_screen == null
 	crosshair.visible = hud.visible
 	hover_label.visible = hud.visible
-	if mode == "remote":
+	if mode == "remote" or (mode == "vault" and vault_host != ""):
 		remote_tick_timer.start()
 	_update_hud()
 
@@ -1360,7 +1559,8 @@ func _on_ssh_world(result: int, code: int, _headers: PackedStringArray, body: Pa
 	if ticket == -1:
 		# Refreshes must belong to the active routing namespace, not a hostname
 		# supplied by the response (different SSH aliases may report the same one).
-		if travel_state == "idle" and mode == "remote" and valid and requested_host != "" and requested_host == remote_host:
+		var active_host := vault_host if mode == "vault" else remote_host
+		if travel_state == "idle" and mode in ["remote", "vault"] and valid and requested_host != "" and requested_host == active_host:
 			_render_remote(parsed)
 		return
 	if ticket != travel_serial or travel_operation != "ssh" or travel_state not in ["depart", "waiting"]:
@@ -1378,13 +1578,22 @@ func _on_ssh_world(result: int, code: int, _headers: PackedStringArray, body: Pa
 
 
 func _refresh_remote() -> void:
-	if travel_state == "idle" and mode == "remote" and remote_host != "" and ssh_http.get_http_client_status() == HTTPClient.STATUS_DISCONNECTED:
-		_request_remote(remote_host, -1)
+	var host := vault_host if mode == "vault" else remote_host
+	if travel_state == "idle" and mode in ["remote", "vault"] and host != "" and ssh_http.get_http_client_status() == HTTPClient.STATUS_DISCONNECTED:
+		_request_remote(host, -1)
 
 
 func _render_remote(parsed: Dictionary) -> void:
+	var previous_positions := {}
+	if remote_roam_host == remote_host:
+		for pid in remote_monoliths:
+			if is_instance_valid(remote_monoliths[pid]):
+				previous_positions[pid] = remote_monoliths[pid].position
+	remote_roam_host = remote_host
 	for c in remote_root.get_children():
-		c.queue_free()
+		if not c in remote_junk_bodies.values():
+			c.queue_free()
+	_sync_junk(parsed.get("junk", []), remote_host)
 	remote_procs = parsed.get("procs", [])
 	var fm := MeshInstance3D.new()
 	var pm := PlaneMesh.new()
@@ -1450,6 +1659,12 @@ func _render_remote(parsed: Dictionary) -> void:
 		cs.shape = shape
 		body.add_child(cs)
 		body.position = Vector3(pos.x, height / 2.0, pos.z)
+		if remote_rogues.has(pid):
+			if previous_positions.has(pid):
+				body.position = previous_positions[pid]
+			else:
+				var roaming := _rogue_roam_pos(pid, rogue_clock, int(world.get("enemies_level", 0)) >= 2)
+				body.position = Vector3(roaming.x, height / 2.0, roaming.z)
 		body.collision_layer = 4
 		remote_root.add_child(body)
 		remote_monoliths[pid] = body
@@ -1463,7 +1678,9 @@ func _render_remote(parsed: Dictionary) -> void:
 			tag.outline_modulate = Color(0, 0, 0, 0.9)
 			tag.modulate = Color(1.0, 0.15, 0.15)
 			tag.position = Vector3(pos.x, height + 16.0, pos.z)
+			tag.position = body.position + Vector3(0, height / 2.0 + 16, 0)
 			remote_root.add_child(tag)
+			body.set_meta("rogue_tag", tag)
 
 
 func _return_home() -> void:
@@ -1480,6 +1697,7 @@ func _remote_proc(pid: int):
 
 func _update_remote_hover() -> void:
 	hover_pid = -1
+	hover_junk_id = ""
 	var space := camera.get_world_3d().direct_space_state
 	var query := PhysicsRayQueryParameters3D.create(
 		camera.global_position,
@@ -1488,6 +1706,9 @@ func _update_remote_hover() -> void:
 	var hit := space.intersect_ray(query)
 	if hit.is_empty() or not hit.has("collider"):
 		hover_label.text = "REMOTE: %s — F/C/K act on this machine · Esc: return home" % remote_host
+		return
+	if pickables.has(hit["collider"]) and pickables[hit["collider"]].get("kind") == "junk":
+		_show_junk_hover(pickables[hit["collider"]])
 		return
 	for pid in remote_monoliths:
 		if remote_monoliths[pid] == hit["collider"]:
@@ -1560,19 +1781,24 @@ func _render_vault(entries: Array, truncated: bool) -> void:
 	title.pixel_size = 0.16
 	title.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	title.modulate = Color(0.95, 0.75, 0.4)
-	title.position = Vector3(0, 70, -160)
+	title.position = Vector3(0, 100, -160)
 	vault_root.add_child(title)
 	# grid of file/dir monoliths, dirs gold, files amber; size = bytes
 	var n := entries.size()
 	var cols := ceili(sqrt(float(maxi(n, 1))))
+	var spacing := 26.0
+	for entry: Dictionary in entries:
+		if not _vault_junk_record(vault_path.rstrip("/") + "/" + str(entry.name)).is_empty():
+			spacing = 64.0  # keep named links legible beside ordinary files
+			break
 	for i in n:
 		var e: Dictionary = entries[i]
 		var sz: float = float(e["size"])
 		var h: float = clampf(2.0 + log(maxf(sz, 1.0)) * 4.0, 2.0, 120.0)
 		var row := i / cols
 		var col := i % cols
-		var x := (float(col) - float(cols) / 2.0) * 26.0
-		var z := (float(row) - float(cols) / 2.0) * 26.0
+		var x := (float(col) - float(cols) / 2.0) * spacing
+		var z := (float(row) - float(cols) / 2.0) * spacing
 		var is_dir: bool = e["dir"]
 		var color: Color = Color(1.0, 0.8, 0.3) if is_dir else Color(0.85, 0.55, 0.3)
 		var body := StaticBody3D.new()
@@ -1595,6 +1821,42 @@ func _render_vault(entries: Array, truncated: bool) -> void:
 		body.collision_layer = 2
 		vault_root.add_child(body)
 		vault_bodies[body] = e
+	_sync_vault_junk()
+
+
+func _vault_junk_record(full: String) -> Dictionary:
+	if vault_host != "" and vault_host != remote_junk_host:
+		return {}
+	var known := local_junk if vault_host == "" else remote_junk
+	for record: Dictionary in known.values():
+		if str(record.get("path", "")) == full:
+			return record
+	return {}
+
+
+func _sync_vault_junk() -> void:
+	for body: StaticBody3D in vault_bodies.keys():
+		var entry: Dictionary = vault_bodies[body]
+		var record := _vault_junk_record(vault_path.rstrip("/") + "/" + str(entry.name))
+		if record.is_empty():
+			if body.has_meta("junk"):
+				# Authoritative cleanup/erase removed a previously marked artifact.
+				vault_bodies.erase(body)
+				body.collision_layer = 0
+				body.queue_free()
+			continue
+		if not body.has_meta("junk"):
+			var mesh: MeshInstance3D = body.get_child(0)
+			mesh.material_override = Art.material(JUNK_COLOR.darkened(0.4), 0.6)
+			# A nofollow listing calls exposed symlinks files. The backing type
+			# comes exclusively from the matched, host-scoped junk registry.
+			var dimensions := Vector3(24, 16, 10) if bool(record.get("dir", false)) else Vector3(12, 26, 5)
+			mesh.scale = dimensions
+			body.get_child(1).shape.size = dimensions
+			body.position.y = dimensions.y * 0.5
+			_decorate_junk(body, record, dimensions, true)
+		body.set_meta("junk", record)
+		body.set_meta("junk_host", vault_host)
 
 
 func _vault_hover() -> Dictionary:
@@ -1620,6 +1882,12 @@ func _vault_hover_text() -> void:
 	var full := vault_path.rstrip("/") + "/" + str(e["name"])
 	hover_label.add_theme_color_override("font_color",
 		Color(1.0, 0.85, 0.4) if e["dir"] else Color(0.9, 0.65, 0.4))
+	var record := _vault_junk_record(full)
+	if not record.is_empty():
+		hover_label.add_theme_color_override("font_color", JUNK_COLOR)
+		hover_label.position.y = get_viewport().get_visible_rect().size.y * 0.58
+		hover_label.text = "JUNK LINK / NEST %s '%s' · %s · %s\n%s\nHold X: ERASE JUNK · disables respawn · ordinary neighbors are REAL FILES" % ["FOLDER" if bool(record.get("dir", false)) else "FILE", str(e.name), _fmt_size(int(record.get("size", 0))), str(record.get("state", "dormant")), full]
+		return
 	var kind := "DIR" if e["dir"] else "FILE"
 	hover_label.text = "%s  '%s'  ·  %s  ·  %s\nEnter: open · hold X: ERASE (real rm)" % [
 		kind, e["name"], _fmt_size(int(e["size"])),
@@ -1642,7 +1910,7 @@ func _vault_leave() -> void:
 
 
 func _vault_erase() -> void:
-	if travel_state != "idle" or actions_need_release:
+	if travel_state != "idle" or actions_need_release or not pending_junk.is_empty() or not pending_shot.is_empty():
 		return
 	var hit := _vault_hover()
 	if hit.is_empty():
@@ -1650,6 +1918,28 @@ func _vault_erase() -> void:
 		return
 	var e: Dictionary = hit["entry"]
 	var full := vault_path.rstrip("/") + "/" + str(e["name"])
+	var record := _vault_junk_record(full)
+	if not record.is_empty():
+		if sim_playing:
+			_set_action_result("error", "REFUSED / SIM / JUNK ERASE FROZEN")
+			return
+		if action_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
+			_set_action_result("error", "BUSY / WAIT FOR THE CURRENT ACTION RESULT")
+			return
+		var junk_payload := {"verb": "junk_rm", "id": str(record.id), "confirm": true}
+		if vault_host != "": junk_payload.host = vault_host
+		pending_junk = {"id": str(record.id), "host": vault_host, "path": full}
+		var error := _request_action(junk_payload)
+		actions_need_release = true
+		if error != OK:
+			pending_junk = {}
+			_set_action_result("error", "NOT ERASED / REQUEST QUEUE ERROR %d" % error)
+			return
+		_set_action_result("pending", "ERASING JUNK / %s / AWAITING DAEMON" % full)
+		return
+	if hit["body"].has_meta("junk"):
+		_set_action_result("error", "REFUSED / JUNK RECORD EXPIRED / REFRESH VAULT")
+		return
 	if oracle_armed and vault_host == "":
 		# armed: the Oracle erases as root — guardrails are its own now
 		_oracle_verb("rm '%s'" % full)
@@ -1675,7 +1965,7 @@ func _set_action_result(state: String, text: String) -> void:
 
 
 func _act(sig: int) -> void:
-	if travel_state != "idle" or actions_need_release or not pending_shot.is_empty():
+	if travel_state != "idle" or actions_need_release or not pending_shot.is_empty() or not pending_junk.is_empty():
 		return
 	if action_http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
 		_set_action_result("error", "BUSY / WAIT FOR THE CURRENT ACTION RESULT")
@@ -1704,15 +1994,30 @@ func _act(sig: int) -> void:
 
 
 func _on_action(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
-	var resp: Variant = JSON.parse_string(body.get_string_from_utf8())
-	var ok: bool = result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300 and resp is Dictionary and bool(resp.get("ok", false))
+	var json := JSON.new()
+	var resp: Variant = json.data if json.parse(body.get_string_from_utf8()) == OK else null
+	var valid_ack: bool = resp is Dictionary and typeof(resp.get("ok")) == TYPE_BOOL
+	var ok: bool = result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300 and valid_ack and resp.ok == true
 	var message := "invalid action response"
-	if resp is Dictionary:
+	if valid_ack:
 		message = str(resp.get("syscall", resp.get("result", "action acknowledged"))) if ok else str(resp.get("error", "action refused"))
 	elif result != HTTPRequest.RESULT_SUCCESS or code != 200:
 		message = "transport failure (HTTP %d / result %d)" % [code, result]
-	var prefix := "CONFIRMED" if ok else "REFUSED" if resp is Dictionary and result == HTTPRequest.RESULT_SUCCESS else "UNCONFIRMED"
+	var mismatched_junk_ack: bool = ok and not pending_junk.is_empty() and resp.get("id") != pending_junk.id
+	if mismatched_junk_ack:
+		ok = false
+		message = "erase acknowledgement missing or mismatched junk ID; artifact preserved"
+	var prefix := "UNCONFIRMED" if mismatched_junk_ack or not valid_ack else "CONFIRMED" if ok else "REFUSED" if result == HTTPRequest.RESULT_SUCCESS else "UNCONFIRMED"
 	var context := ""
+	if not pending_junk.is_empty():
+		context = " / JUNK %s @ %s" % [str(pending_junk.id), str(pending_junk.host) if pending_junk.host != "" else "LOCAL"]
+		if ok:
+			var host := str(pending_junk.host)
+			var known := local_junk if host == "" else remote_junk
+			if host == "" or host == remote_junk_host:
+				known.erase(str(pending_junk.id))
+				_sync_junk(known.values(), host)
+		pending_junk = {}
 	if not pending_shot.is_empty():
 		context = " / PID %d @ %s" % [int(pending_shot["pid"]), str(pending_shot["host"])]
 		if is_instance_valid(action_effects):
@@ -1733,7 +2038,7 @@ func _update_hud() -> void:
 		"last_action": last_action, "oracle_armed": oracle_armed,
 		"sim_playing": sim_playing, "sim_info": sim_info,
 		"rogue_kills": rogue_kills, "rogue_frees": rogue_frees,
-		"action_result": action_result if not pending_shot.is_empty() or Time.get_ticks_msec() < action_result_expires else {},
+		"action_result": action_result if not pending_shot.is_empty() or not pending_junk.is_empty() or Time.get_ticks_msec() < action_result_expires else {},
 		"vault_entries": vault_bodies.size(), "vault_parent": vault_parent,
 		"remote_procs": remote_procs.size(),
 	})

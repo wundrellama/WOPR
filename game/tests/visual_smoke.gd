@@ -34,6 +34,17 @@ class VisualWorld extends "res://scripts/main.gd":
 	func _vault_erase() -> void:
 		assert(false, "No file actions in visual tests")
 
+	func _request_action(_payload: Dictionary) -> Error:
+		assert(false, "No HTTP actions in visual tests")
+		return ERR_UNAUTHORIZED
+
+	# Explicit safe entry points: real navigation/erase logic, intercepted I/O.
+	func fixture_input(event: InputEvent) -> void:
+		super._unhandled_input(event)
+
+	func fixture_erase() -> void:
+		super._vault_erase()
+
 
 func _initialize() -> void:
 	call_deferred("_run")
@@ -55,6 +66,8 @@ func _run() -> void:
 	var data := _fixture()
 	if view in ["hunt", "hunt-behind"]:
 		data.enemies = [120, 121, 122]
+	if view in ["junk", "junk-vault", "remote-junk"]:
+		data.junk = _junk_fixture()
 	if snapshot != "":
 		data = JSON.parse_string(FileAccess.get_file_as_string(snapshot))
 		assert(data.has("procs"), "Invalid read-only snapshot")
@@ -69,27 +82,41 @@ func _run() -> void:
 			game.selected_pid = 120
 		elif view == "sim":
 			game.sim_playing = true
-		elif view == "remote":
+		elif view in ["remote", "remote-junk"]:
 			game._travel_to("test-remote")
 			game._on_ssh_world(0, 200, PackedStringArray(), JSON.stringify({
-				"host": "test-remote", "procs": data["procs"], "mem": data["mem"],
-				"load": [0.2, 0.4, 0.5], "enemies": [120]
+				"host": "reported-fixture-hostname", "procs": data["procs"], "mem": data["mem"],
+				"load": [0.2, 0.4, 0.5], "enemies": [120], "junk": data.get("junk", [])
 			}).to_utf8_buffer(), game.travel_serial)
 			game._advance_travel(0.8)
 			game._advance_travel(0.8)
 			game._process(0)
 			game.remote_tick_timer.stop()
 			game.selected_pid = 120
-		elif view == "vault":
-			game._enter_vault("/TEST-FIXTURE/NOT-REAL-FILES")
+			if view == "remote-junk":
+				game.selected_pid = -1
+				game.camera.position = Vector3(game.VAULTS_X + 110, 170, 430)
+				game.camera.look_at(Vector3(game.VAULTS_X + 110, 75, 60))
+		elif view in ["vault", "junk-vault"]:
+			var fixture_path := "/home/FIXTURE-USER/Documents" if view == "junk-vault" else "/TEST-FIXTURE/NOT-REAL-FILES"
+			var entries: Array = [{"name": "fixture-directory", "size": 4096, "dir": true, "mtime": 0},
+				{"name": "fixture-file", "size": 1048576, "dir": false, "mtime": 0}]
+			if view == "junk-vault":
+				entries = []
+				for record: Dictionary in data.junk:
+					entries.append({"name": record.name, "size": 64, "dir": false, "mtime": 0})
+				entries.append({"name": "ordinary-journal.txt", "size": 8192, "dir": false, "mtime": 0})
+			game._enter_vault(fixture_path)
 			game._on_listing(0, 200, PackedStringArray(), JSON.stringify({
-				"path": "/TEST-FIXTURE/NOT-REAL-FILES", "parent": "/TEST-FIXTURE",
-				"entries": [{"name": "fixture-directory", "size": 4096, "dir": true, "mtime": 0},
-					{"name": "fixture-file", "size": 1048576, "dir": false, "mtime": 0}]
+				"path": fixture_path, "parent": "/home/FIXTURE-USER" if view == "junk-vault" else "/TEST-FIXTURE",
+				"entries": entries
 			}).to_utf8_buffer(), game.travel_serial)
 			game._advance_travel(0.8)
 			game._advance_travel(0.8)
 			game._process(0)
+		elif view == "junk":
+			game.camera.position = Vector3(game.VAULTS_X + 110, 170, 430)
+			game.camera.look_at(Vector3(game.VAULTS_X + 110, 75, 60))
 		elif view == "armed":
 			game.oracle_armed = true
 		elif view == "ritual":
@@ -97,6 +124,8 @@ func _run() -> void:
 		elif view == "farewell":
 			game._show_farewell()
 		game._update_hud()
+		game.yaw = game.camera.rotation.y
+		game.pitch = game.camera.rotation.x
 	# Compile shaders and exercise _process(), not just the GDScript parser.
 	for frame in 40:
 		await process_frame
@@ -118,6 +147,11 @@ func _run() -> void:
 			assert(game.console._labels.safety.text == "SIM / ALL VERBS FROZEN")
 		if view == "armed":
 			assert(game.console._labels.safety.text == "ROOT ARMED / REAL SYSCALLS")
+		if view in ["junk", "junk-vault", "remote-junk"]:
+			assert(game.crosshair.junk_targets.size() == 2, "Both synthetic artifacts have locators")
+			for artifact: StaticBody3D in game.crosshair.junk_targets.values():
+				assert(artifact.has_node("JunkLabel" if view == "junk-vault" else "VaultBeaconLabel"), "Only vault entries are file objects; outdoor targets are destination beacons")
+				assert(artifact.get_parent() == (game.vault_root if view == "junk-vault" else game.remote_root if view == "remote-junk" else game.world_root), "No outdoor locator leaks across modes")
 	for request in [game.world_http, game.action_http, game.list_http, game.ssh_http]:
 		assert(request.get_http_client_status() == HTTPClient.STATUS_DISCONNECTED, "Visual tests must not contact any server")
 	print("VISUAL_SMOKE_OK view=", view, " processes=", data["procs"].size(),
@@ -147,3 +181,9 @@ static func _fixture() -> Dictionary:
 			"total": 1099511627776, "fstype": "test"}]},
 		"ssh": {"hosts": [], "status": {}}, "enemies": [120], "enemies_level": 1,
 		"oracle": {"armed": false}, "sim": {"playing": false, "length": 600, "idx": 40, "name": "visual fixture"}}
+
+
+static func _junk_fixture() -> Array:
+	return [
+		{"id": "0123456789abcdef0123456789abcdef", "path": "/home/FIXTURE-USER/Documents/wopr-0123456789abcdef0123456789abcdef-junk.link", "parent": "/home/FIXTURE-USER/Documents", "name": "wopr-0123456789abcdef0123456789abcdef-junk.link", "dir": false, "size": 1048576, "pid": 120, "state": "active", "respawns": 0},
+		{"id": "abcdef0123456789abcdef0123456789", "path": "/home/FIXTURE-USER/Documents/wopr-abcdef0123456789abcdef0123456789-nest.link", "parent": "/home/FIXTURE-USER/Documents", "name": "wopr-abcdef0123456789abcdef0123456789-nest.link", "dir": true, "size": 4096, "pid": 0, "state": "respawning", "respawns": 1}]
