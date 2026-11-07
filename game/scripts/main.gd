@@ -64,6 +64,7 @@ var remote_monoliths: Dictionary = {}  # pid -> StaticBody3D on remote
 var remote_tick_timer: Timer
 var ssh_http: HTTPRequest
 var targets: Dictionary = {}       # pid -> Vector3 target (lerped each frame)
+var rogue_tags: Dictionary = {}    # pid -> Label3D floating over a ROGUE
 var roads: Dictionary = {}         # ip -> {start, end, mat, packets}
 var kernel_ring_rot := 0.0
 var water_y := 6.0
@@ -503,6 +504,23 @@ func _sync_procs() -> void:
 				base = Color(1.0, 0.85, 0.2)  # locked target = gold
 			mat2.albedo_color = base.darkened(0.35 - cpu * 0.35)
 			mat2.emission = base * (0.15 + cpu * 0.65)
+		# ROGUEs get a floating tag so they can't hide in the crowd
+		if pid in world.get("enemies", []):
+			if not rogue_tags.has(pid):
+				var tag := Label3D.new()
+				tag.text = "▼ ROGUE ▼"
+				tag.font_size = 64
+				tag.pixel_size = 0.02
+				tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+				tag.outline_size = 8
+				tag.outline_modulate = Color(0, 0, 0, 0.9)
+				tag.modulate = Color(1.0, 0.15, 0.15)
+				world_root.add_child(tag)
+				rogue_tags[pid] = tag
+			rogue_tags[pid].position = body3d.position + Vector3(0, height * 0.5 + 14.0, 0)
+		elif rogue_tags.has(pid):
+			rogue_tags[pid].queue_free()
+			rogue_tags.erase(pid)
 	for pid in monoliths.keys():
 		if not alive.has(pid):
 			pickables.erase(monoliths[pid])
@@ -510,6 +528,9 @@ func _sync_procs() -> void:
 			monoliths.erase(pid)
 			targets.erase(pid)
 			bob_phase.erase(pid)
+			if rogue_tags.has(pid):
+				rogue_tags[pid].queue_free()
+				rogue_tags.erase(pid)
 			if pid == selected_pid:
 				selected_pid = -1
 
@@ -588,6 +609,11 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_V:
 				if mode == "remote" and remote_host != "":
 					_enter_vault("~", remote_host)
+			KEY_H:
+				var want: bool = not bool(world.get("enemies_on", false))
+				action_http.request(API + "/action", [], HTTPClient.METHOD_POST,
+					JSON.stringify({"verb": "enemies", "on": want}))
+				last_action = "hunting %s" % ("ON — rogues will spawn" if want else "OFF — rogues purged")
 
 
 func _process(delta: float) -> void:
@@ -628,6 +654,13 @@ func _process(delta: float) -> void:
 		if not targets.has(pid):
 			continue
 		body3d.position = body3d.position.lerp(targets[pid], clampf(delta * 2.5, 0.0, 1.0))
+		if rogue_tags.has(pid):
+			# heartbeat pulse on the ROGUE monolith + tag
+			var pulse := 0.5 + 0.5 * sin(now * 5.0)
+			var rmat: StandardMaterial3D = body3d.get_child(0).material_override
+			rmat.emission = Color(1.0, 0.1, 0.1) * (0.4 + pulse * 1.2)
+			(rogue_tags[pid] as Label3D).modulate = Color(1.0, 0.15 + pulse * 0.4, 0.15)
+			rogue_tags[pid].position = body3d.position + Vector3(0, body3d.get_child(1).shape.size.y * 0.5 + 14.0, 0)
 		var p = _proc(pid)
 		if p != null and p["state"] != "T":
 			var cpu: float = clampf(float(p["cpu"]) / 100.0, 0.0, 1.0)
@@ -1096,8 +1129,13 @@ func _update_hud() -> void:
 		"WASD move · Q/E down/up · Shift sprint · mouse look · ESC quit",
 		"F freeze (SIGSTOP) · C resume (SIGCONT) · Shift+K smite (SIGKILL) — REAL syscalls",
 		"purple=Kernel Spirit · green=Daemon · cyan=Your Kin · orange=User Agent · gold=Init God · grey=Frozen",
-		"last: " + last_action,
 	]
+	var n_rogues: int = world.get("enemies", []).size()
+	if bool(world.get("enemies_on", false)):
+		lines.append("HUNT [H]: ON — %d ROGUE%s alive. Find them: RED monoliths, pulsing, tagged ROGUE, roaming the CPU plains." % [n_rogues, "s" if n_rogues != 1 else ""])
+	else:
+		lines.append("HUNT [H]: OFF — press H to release the rogues")
+	lines.append("last: " + last_action)
 	var p = null
 	if selected_pid >= 0:
 		p = _proc(selected_pid)

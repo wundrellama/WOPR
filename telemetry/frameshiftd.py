@@ -55,6 +55,17 @@ ENEMY_SPAWN_SECS = float(os.environ.get("FRAMESHIFT_ENEMY_SPAWN", "20"))
 ENEMY_FREEZE_ESCAPE = 8.0
 ENEMIES = {}  # pid -> {"proc": Popen, "spawned": t, "frozen_since": float|None}
 _last_spawn = [0.0]
+ENEMIES_ENABLED = [False]  # opt-in: POST /action {"verb":"enemies","on":true}
+
+
+def _child_guard() -> None:
+    """Runs in the child between fork and exec (child context!)."""
+    os.nice(19)
+    os.setpgrp()  # own process group; can't accidentally signal our session
+    # kernel guarantee: SIGTERM the instant the daemon dies, even if the
+    # child is SIGSTOPped (a frozen process cannot run its own TTL clock)
+    import ctypes
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, 15)  # PR_SET_PDEATHSIG, SIGTERM
 
 _BURN = (
     "import time,sys,random\n"
@@ -78,7 +89,7 @@ def _spawn_enemy():
     p = subprocess.Popen(
         [sys.executable, "-c", _BURN, str(ENEMY_TTL), str(hog_mb * 1024 * 1024)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        preexec_fn=lambda: os.nice(19),
+        preexec_fn=_child_guard,
     )
     ENEMIES[p.pid] = {"proc": p, "spawned": time.time(), "frozen_since": None}
     return p.pid
@@ -94,8 +105,12 @@ def _kill_all_enemies():
 
 
 def _tend_enemies():
-    """Reap dead, punish freezes, keep the world at population."""
+    """Reap dead, punish freezes, keep the world at population (if opted in)."""
     now = time.time()
+    if not ENEMIES_ENABLED[0]:
+        if ENEMIES:
+            _kill_all_enemies()
+        return
     for pid in list(ENEMIES.keys()):
         e = ENEMIES[pid]
         if e["proc"].poll() is not None:
@@ -516,6 +531,7 @@ def gather_world(tick: int) -> dict:
         "procs": gather_processes(),
         "net": gather_net(),
         "enemies": sorted(ENEMIES.keys()),
+        "enemies_on": ENEMIES_ENABLED[0],
         "ssh": {"hosts": ssh_hosts(), "status": ssh_probe_status()},
     }
 
@@ -550,7 +566,13 @@ class _Handler(BaseHTTPRequestHandler):
             req = json.loads(self.rfile.read(n))
             verb = req.get("verb")
             host = req.get("host")
-            if host:
+            if verb == "enemies":
+                ENEMIES_ENABLED[0] = bool(req.get("on"))
+                if not ENEMIES_ENABLED[0]:
+                    _kill_all_enemies()
+                body = json.dumps({"ok": True,
+                                   "enemies": ENEMIES_ENABLED[0]}).encode()
+            elif host:
                 body = json.dumps(remote_action(str(host), req)).encode()
             elif verb == "rm":
                 body = self._do_rm(req)
