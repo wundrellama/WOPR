@@ -220,12 +220,13 @@ func _make_screen(title: String, sub: String, blink: String) -> Control:
 	b.add_theme_color_override("font_color", Color(0.9, 1.0, 0.9))
 	b.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	vb.add_child(b)
-	# blink timer
+	# blink via alpha, NOT visible: toggling visible reflows the VBox and
+	# makes the lines above jump
 	var tm := Timer.new()
 	tm.wait_time = 0.7
 	tm.autostart = true
 	vb.add_child(tm)
-	tm.timeout.connect(func(): b.visible = not b.visible)
+	tm.timeout.connect(func(): b.modulate.a = 0.0 if b.modulate.a > 0.5 else 1.0)
 	return panel
 
 
@@ -264,7 +265,7 @@ func _build_farewell() -> void:
 		return
 	farewell = _make_screen("How about a nice game of chess?",
 		"",
-		"— PRESS ENTER TO RETURN —")
+		"— PRESS ENTER TO RETURN · ESC TO EXIT —")
 	add_child(farewell)
 
 
@@ -649,15 +650,17 @@ func _species_color(p: Dictionary) -> Color:
 
 func _unhandled_input(event: InputEvent) -> void:
 	if splash != null or farewell != null:
-		if event is InputEventKey and event.pressed and (
-				event.keycode == KEY_ENTER or event.keycode == KEY_KP_ENTER):
-			if splash != null:
-				_start_game()
-			else:
-				# back to the title screen for another round
-				farewell.queue_free()
-				farewell = null
-				_build_splash()
+		if event is InputEventKey and event.pressed:
+			if event.keycode == KEY_ENTER or event.keycode == KEY_KP_ENTER:
+				if splash != null:
+					_start_game()
+				else:
+					# back to the title screen for another round
+					farewell.queue_free()
+					farewell = null
+					_build_splash()
+			elif event.keycode == KEY_ESCAPE:
+				get_tree().quit()
 		return
 	if event is InputEventMouseMotion and Input.get_mouse_mode() == Input.MOUSE_MODE_CAPTURED:
 		yaw -= event.relative.x * 0.0025
