@@ -63,6 +63,17 @@ var remote_procs: Array = []
 var remote_monoliths: Dictionary = {}  # pid -> StaticBody3D on remote
 var remote_tick_timer: Timer
 var ssh_http: HTTPRequest
+var targets: Dictionary = {}       # pid -> Vector3 target (lerped each frame)
+var roads: Dictionary = {}         # ip -> {start, end, mat, packets}
+var kernel_ring_rot := 0.0
+var water_y := 6.0
+
+# district anchors — far enough apart to read as separate countries
+const HARBOR_X := -1000.0
+const VAULTS_X := 1000.0
+const PLAINS_Z := 800.0
+const FORGE_Z := -800.0
+const HOME_POS := Vector3(0, 240, 1250)
 
 func _ready() -> void:
 	world_http = HTTPRequest.new()
@@ -99,49 +110,53 @@ func _ready() -> void:
 	var we := WorldEnvironment.new()
 	env = Environment.new()
 	env.background_mode = Environment.BG_COLOR
+	env.background_color = Color(0.005, 0.01, 0.03)
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	env.ambient_light_color = Color(0.15, 0.2, 0.35)
-	env.ambient_light_energy = 0.6
+	env.ambient_light_color = Color(0.08, 0.12, 0.22)
+	env.ambient_light_energy = 0.5
 	env.fog_enabled = true
-	env.fog_light_color = Color(0.03, 0.05, 0.1)
-	env.fog_density = 0.0035
+	env.fog_light_color = Color(0.02, 0.04, 0.10)
+	env.fog_density = 0.0018
+	env.glow_enabled = true
+	env.glow_intensity = 1.4
+	env.glow_bloom = 0.25
+	env.glow_blend_mode = Environment.GLOW_BLEND_MODE_SCREEN
+	env.tonemap_mode = Environment.TONE_MAPPER_LINEAR
 	we.environment = env
 	add_child(we)
 
 	var sun := DirectionalLight3D.new()
 	sun.rotation_degrees = Vector3(-55, 35, 0)
-	sun.light_energy = 0.8
-	sun.light_color = Color(0.7, 0.8, 1.0)
+	sun.light_energy = 0.35
+	sun.light_color = Color(0.5, 0.6, 1.0)
 	add_child(sun)
 
+	# --- tron grid floor: dark plates, glowing seams ---
 	var floor_mesh := MeshInstance3D.new()
 	var pm := PlaneMesh.new()
-	pm.size = Vector2(3000, 3000)
-	var fmat := StandardMaterial3D.new()
-	fmat.albedo_color = Color(0.04, 0.06, 0.10)
-	fmat.emission_enabled = true
-	fmat.emission = Color(0.01, 0.03, 0.06)
+	pm.size = Vector2(6000, 6000)
+	var fmat := ShaderMaterial.new()
+	fmat.shader = preload("res://shaders/grid.gdshader")
 	floor_mesh.material_override = fmat
 	floor_mesh.mesh = pm
 	add_child(floor_mesh)
 
-	# --- the tide (memory water) ---
+	# --- the tide (memory water): animated neon sheet ---
 	water = MeshInstance3D.new()
 	var wpm := PlaneMesh.new()
-	wpm.size = Vector2(3000, 3000)
-	var wmat := StandardMaterial3D.new()
-	wmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	wmat.albedo_color = Color(0.1, 0.35, 0.7, 0.35)
-	wmat.emission_enabled = true
-	wmat.emission = Color(0.05, 0.2, 0.5)
+	wpm.size = Vector2(6000, 6000)
+	wpm.subdivide_width = 96
+	wpm.subdivide_depth = 96
+	var wmat := ShaderMaterial.new()
+	wmat.shader = preload("res://shaders/tide.gdshader")
 	water.material_override = wmat
 	water.mesh = wpm
-	water.position = Vector3(0, 5, 0)
+	water.position = Vector3(0, 6, 0)
 	add_child(water)
 
 	# --- player ---
 	camera = Camera3D.new()
-	camera.position = Vector3(0, 120, 520)
+	camera.position = HOME_POS
 	add_child(camera)
 	camera.current = true
 	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
@@ -225,51 +240,94 @@ func _add_label(text: String, pos: Vector3, color: Color) -> void:
 
 func _build_geography() -> void:
 	var ncores: int = int(world["cpu"]["count"])
-	# CPU PLAINS: grid of core pillars, north of center
+	# CPU PLAINS: grid of core pillars, far north
 	var cols := ceili(sqrt(float(ncores)))
 	for i in ncores:
 		var row := i / cols
 		var col := i % cols
-		var p := Vector3((col - cols / 2.0) * 70.0, 18, 300.0 + row * 70.0)
+		var p := Vector3((col - cols / 2.0) * 90.0, 18, PLAINS_Z - 300.0 + row * 90.0)
 		var body := _add_box(p, Vector3(10, 36, 10),
 			Color(0.55, 0.75, 1.0), {"kind": "core", "core": i})
 		core_bodies.append(body)
-	_add_label("CPU PLAINS — %d cores" % ncores, Vector3(0, 80, 300), Color(0.55, 0.75, 1.0))
+	_add_label("CPU PLAINS — %d cores" % ncores, Vector3(0, 120, PLAINS_Z), Color(0.55, 0.75, 1.0))
 
-	# NETWORK HARBOR: west
-	_add_label("NETWORK HARBOR", Vector3(-450, 90, 0), Color(0.2, 0.9, 0.8))
+	# NETWORK HARBOR: west — towers in a wide arc facing the sea
+	_add_label("NETWORK HARBOR", Vector3(HARBOR_X, 150, 0), Color(0.2, 0.9, 0.8))
 
 	# FILE VAULTS: east
-	_add_label("FILE VAULTS", Vector3(450, 90, 0), Color(0.95, 0.75, 0.4))
+	_add_label("FILE VAULTS", Vector3(VAULTS_X, 150, 0), Color(0.95, 0.75, 0.4))
 	var mounts: Array = world.get("hw", {}).get("mounts", [])
 	for i in mounts.size():
 		var mnt: Dictionary = mounts[i]
 		var pct: float = float(mnt["percent"])
-		var h: float = maxf(6.0, pct * 0.9)
-		var z := (float(i) - float(mounts.size()) / 2.0) * 60.0
-		_add_box(Vector3(450, h / 2.0, z), Vector3(28, h, 28),
+		var h: float = maxf(6.0, pct * 1.4)
+		var z := (float(i) - float(mounts.size()) / 2.0) * 110.0
+		_add_box(Vector3(VAULTS_X, h / 2.0, z), Vector3(34, h, 34),
 			Color(0.95, 0.75, 0.4), {"kind": "mount", "mnt": mnt})
 
 	# GPU FORGE: south
-	var forge_pos := Vector3(0, 30, -320)
+	var forge_pos := Vector3(0, 30, FORGE_Z)
 	forge_body = _add_box(forge_pos, Vector3(60, 60, 60),
 		Color(1.0, 0.4, 0.15), {"kind": "forge"})
-	_add_label("GPU FORGE", forge_pos + Vector3(0, 55, 0), Color(1.0, 0.5, 0.2))
+	_add_label("GPU FORGE", forge_pos + Vector3(0, 70, 0), Color(1.0, 0.5, 0.2))
 
-	# KERNEL RING label
-	_add_label("KERNEL RING", Vector3(0, 110, 0), Color(0.75, 0.55, 1.0))
+	# KERNEL RING: the capital at center
+	_add_label("KERNEL RING", Vector3(0, 150, 0), Color(0.75, 0.55, 1.0))
+
+	# light-roads linking the capital to each district
+	_add_road("rd_plains", Vector3.ZERO, Vector3(0, 0, PLAINS_Z - 340), Color(0.55, 0.75, 1.0), 3.0)
+	_add_road("rd_harbor", Vector3.ZERO, Vector3(HARBOR_X + 260, 0, 0), Color(0.2, 0.9, 0.8), 4.0)
+	_add_road("rd_vaults", Vector3.ZERO, Vector3(VAULTS_X - 60, 0, 0), Color(0.95, 0.75, 0.4), 1.5)
+	_add_road("rd_forge", Vector3.ZERO, Vector3(0, 0, FORGE_Z + 60), Color(1.0, 0.45, 0.2), 2.0)
+
+
+func _add_road(key: String, from: Vector3, to: Vector3, color: Color, flow: float) -> void:
+	if roads.has(key):
+		roads[key]["end"] = to
+		roads[key]["flow"] = flow
+		return
+	var road := MeshInstance3D.new()
+	var rbm := BoxMesh.new()
+	road.mesh = rbm
+	var rmat := StandardMaterial3D.new()
+	rmat.emission_enabled = true
+	rmat.albedo_color = color
+	rmat.emission = color * 0.5
+	road.material_override = rmat
+	var dist := Vector3(to.x - from.x, 0, to.z - from.z).length()
+	road.position = (from + to) / 2.0 + Vector3(0, 1.5, 0)
+	road.scale = Vector3(2.0, 1.5, maxf(dist, 1.0))
+	world_root.add_child(road)
+	road.look_at(to + Vector3(0, 1.5, 0))
+	# traffic packets: little light-cars riding the road
+	var packets := []
+	for i in 3:
+		var pk := MeshInstance3D.new()
+		var sp := SphereMesh.new()
+		sp.radius = 3.0
+		sp.height = 6.0
+		sp.radial_segments = 8
+		sp.rings = 4
+		pk.mesh = sp
+		var pmat := StandardMaterial3D.new()
+		pmat.emission_enabled = true
+		pmat.albedo_color = color.lightened(0.5)
+		pmat.emission = color * 1.5
+		pk.material_override = pmat
+		world_root.add_child(pk)
+		packets.append({"mesh": pk, "t": randf() * 2.0})
+	roads[key] = {"start": from, "end": to, "mesh": road, "mat": rmat, "packets": packets, "flow": flow}
 
 
 func _tower_pos(idx: int, total: int) -> Vector3:
 	var t := idx / maxf(float(total - 1), 1.0)
-	var ang := lerpf(deg_to_rad(-75.0), deg_to_rad(75.0), t)
-	return Vector3(-450.0, 0, 0) + Vector3(cos(ang) * 140.0, 0, sin(ang) * 280.0)
+	var ang := lerpf(deg_to_rad(-80.0), deg_to_rad(80.0), t)
+	return Vector3(HARBOR_X, 0, 0) + Vector3(cos(ang) * 260.0, 0, sin(ang) * 420.0)
 
 
 func _update_geo() -> void:
-	# tide: memory percent -> water height
-	var mem_pct: float = float(world["mem"]["percent"])
-	water.position.y = lerpf(0.5, 40.0, mem_pct / 100.0)
+	# tide: memory percent -> water height (lerped in _process for smoothness)
+	water_y = lerpf(2.0, 60.0, float(world["mem"]["percent"]) / 100.0)
 
 	# forge glow: gpu busy
 	if forge_body != null:
@@ -303,21 +361,9 @@ func _update_geo() -> void:
 			body = _add_box(Vector3(pos.x, h / 2.0, pos.z),
 				Vector3(14, h, 14), Color(0.2, 0.9, 0.8), {"kind": "tower", "remote": r})
 			tower_bodies[ip] = body
-			# light-road from world center to tower
-			var road := MeshInstance3D.new()
-			var rbm := BoxMesh.new()
-			rbm.size = Vector3(1, 1.5, 1)
-			road.mesh = rbm
-			var rmat := StandardMaterial3D.new()
-			rmat.emission_enabled = true
-			rmat.albedo_color = Color(0.2, 0.9, 0.8)
-			rmat.emission = Color(0.2, 0.9, 0.8) * 0.6
-			road.material_override = rmat
-			var mid := Vector3(pos.x / 2.0, 2.0, pos.z / 2.0)
-			road.position = mid
-			road.scale = Vector3(1.5, 1.5, maxf(mid.length() * 2.0, 1.0))
-			world_root.add_child(road)
-			road.look_at(Vector3(pos.x, 2.0, pos.z))
+			# light-road from harbor mouth to tower, flow ~ connection count
+			_add_road("rd_" + ip, Vector3(HARBOR_X + 260, 0, 0), pos,
+				Color(0.2, 0.9, 0.8), clampf(float(r["count"]) * 0.4, 0.5, 6.0))
 		var tmat: StandardMaterial3D = body.get_child(0).material_override
 		tmat.emission = Color(0.2, 0.9, 0.8) * (0.2 + clampf(float(r["count"]) / 20.0, 0.0, 0.8))
 	for ip in tower_bodies.keys():
@@ -325,6 +371,11 @@ func _update_geo() -> void:
 			pickables.erase(tower_bodies[ip])
 			tower_bodies[ip].queue_free()
 			tower_bodies.erase(ip)
+			if roads.has("rd_" + ip):
+				for pk in roads["rd_" + ip]["packets"]:
+					pk["mesh"].queue_free()
+				roads["rd_" + ip]["mesh"].queue_free()
+				roads.erase("rd_" + ip)
 	_update_ssh_gates()
 
 
@@ -337,10 +388,10 @@ func _update_ssh_gates() -> void:
 		var h: String = hosts[i]
 		seen[h] = true
 		var st: String = str(status.get(h, "unknown"))
-		# gates stand in the harbor foreground, distinct from traffic towers
-		var ang := lerpf(deg_to_rad(-60.0), deg_to_rad(60.0),
+		# gates stand at the harbor mouth, facing the capital
+		var ang := lerpf(deg_to_rad(-70.0), deg_to_rad(70.0),
 			i / maxf(float(hosts.size() - 1), 1.0))
-		var pos := Vector3(-260.0 + cos(ang) * 60.0, 0, sin(ang) * 160.0)
+		var pos := Vector3(HARBOR_X + 500.0 + cos(ang) * 90.0, 0, sin(ang) * 260.0)
 		var color: Color
 		match st:
 			"open":
@@ -382,19 +433,19 @@ func _district_pos(p: Dictionary) -> Vector3:
 	var h1 := (pid * 2654435761) % 4093
 	var h2 := (pid * 40503) % 4099
 	if pid in world.get("enemies", []):
-		# rogues roam the plains: hash anchor + slow lissajous drift per tick
+		# rogues roam the CPU plains: hash anchor + slow lissajous drift per tick
 		var t := float(world.get("tick", 0))
 		var ph := float(h1 % 628) / 100.0
-		var ax := float(h1 % 300) - 150.0
-		var az := float(h2 % 200) - 100.0
-		return Vector3(ax + sin(t * 0.35 + ph) * 90.0, 0,
-			az + cos(t * 0.27 + ph * 1.7) * 70.0)
+		var ax := float(h1 % 500) - 250.0
+		var az := PLAINS_Z - 200.0 + float(h2 % 300) - 150.0
+		return Vector3(ax + sin(t * 0.35 + ph) * 120.0, 0,
+			az + cos(t * 0.27 + ph * 1.7) * 90.0)
 	if pid == 1:
 		return Vector3.ZERO
 	if p["ppid"] == 2 or (p["ppid"] == 1 and str(p["name"]).begins_with("[")):
-		# kernel spirits: ring around the Init God
-		var ang := lerpf(0, TAU, float(h1 % 1000) / 1000.0)
-		var rad := 110.0 + float(h2 % 100) * 0.6
+		# kernel spirits: a slowly rotating ring around the Init God
+		var ang := lerpf(0, TAU, float(h1 % 1000) / 1000.0) + kernel_ring_rot
+		var rad := 160.0 + float(h2 % 100) * 0.9
 		return Vector3(cos(ang) * rad, 0, sin(ang) * rad)
 	var cn: int = int(p.get("cpu_num", -1))
 	if cn >= 0 and cn < core_bodies.size():
@@ -402,7 +453,7 @@ func _district_pos(p: Dictionary) -> Vector3:
 		var base: Vector3 = core_bodies[cn].position
 		return Vector3(base.x + float(h1 % 50) - 25.0, 0, base.z + float(h2 % 50) - 25.0)
 	# wanderers (no cpu affinity info): between center and plains
-	return Vector3(float(h1 % 160) - 80.0, 0, 140.0 + float(h2 % 80))
+	return Vector3(float(h1 % 300) - 150.0, 0, 320.0 + float(h2 % 180))
 
 
 func _sync_procs() -> void:
@@ -434,11 +485,12 @@ func _sync_procs() -> void:
 			cs.shape = shape
 			body.add_child(cs)
 			world_root.add_child(body)
+			body.position = Vector3(pos.x, height / 2.0, pos.z)
 			monoliths[pid] = body
 			pickables[body] = {"kind": "proc", "pid": pid}
 			bob_phase[pid] = randf() * TAU
 		var body3d: StaticBody3D = monoliths[pid]
-		body3d.position = Vector3(pos.x, height / 2.0, pos.z)
+		targets[pid] = Vector3(pos.x, height / 2.0, pos.z)
 		m.scale = Vector3(6.0, height, 6.0)
 		body3d.get_child(1).shape.size = Vector3(6.0, height, 6.0)
 		var mat2: StandardMaterial3D = m.material_override
@@ -456,6 +508,7 @@ func _sync_procs() -> void:
 			pickables.erase(monoliths[pid])
 			monoliths[pid].queue_free()
 			monoliths.erase(pid)
+			targets.erase(pid)
 			bob_phase.erase(pid)
 			if pid == selected_pid:
 				selected_pid = -1
@@ -566,13 +619,25 @@ func _process(delta: float) -> void:
 		_update_remote_hover()
 	else:
 		_update_hover()
-	# living world breathes; frozen ones don't
+	# living world: glide monoliths toward their targets every frame
+	kernel_ring_rot += delta * 0.05
+	water.position.y = lerpf(water.position.y, water_y, clampf(delta * 0.7, 0.0, 1.0))
+	var now := Time.get_ticks_msec() / 1000.0
 	for pid in monoliths:
 		var body3d: StaticBody3D = monoliths[pid]
+		if not targets.has(pid):
+			continue
+		body3d.position = body3d.position.lerp(targets[pid], clampf(delta * 2.5, 0.0, 1.0))
 		var p = _proc(pid)
 		if p != null and p["state"] != "T":
 			var cpu: float = clampf(float(p["cpu"]) / 100.0, 0.0, 1.0)
-			body3d.position.y += sin(Time.get_ticks_msec() / 300.0 + bob_phase[pid]) * cpu * 0.02
+			body3d.position.y += sin(now * 3.0 + bob_phase[pid]) * (0.3 + cpu * 2.5) * 0.5
+	# light-road traffic
+	for key in roads:
+		var rd: Dictionary = roads[key]
+		for pk in rd["packets"]:
+			pk["t"] = fmod(pk["t"] + delta * rd["flow"] * 0.25, 1.0)
+			pk["mesh"].position = rd["start"].lerp(rd["end"], pk["t"]) + Vector3(0, 4.0, 0)
 
 
 func _proc(pid: int):
@@ -709,11 +774,11 @@ func _render_remote(parsed: Dictionary) -> void:
 	remote_procs = parsed.get("procs", [])
 	var fm := MeshInstance3D.new()
 	var pm := PlaneMesh.new()
-	pm.size = Vector2(2000, 2000)
-	var fmat := StandardMaterial3D.new()
-	fmat.albedo_color = Color(0.03, 0.06, 0.05)
-	fmat.emission_enabled = true
-	fmat.emission = Color(0.01, 0.04, 0.03)
+	pm.size = Vector2(4000, 4000)
+	var fmat := ShaderMaterial.new()
+	fmat.shader = preload("res://shaders/grid.gdshader")
+	fmat.set_shader_parameter("seam_color", Color(0.05, 0.7, 0.4))
+	fmat.set_shader_parameter("major_color", Color(0.2, 1.0, 0.6))
 	fm.material_override = fmat
 	fm.mesh = pm
 	remote_root.add_child(fm)
@@ -966,7 +1031,7 @@ func _vault_leave() -> void:
 	world_root.visible = true
 	vault_root.visible = false
 	vault_bodies.clear()
-	camera.position = Vector3(0, 120, 520)
+	camera.position = HOME_POS
 	yaw = 0.0
 	pitch = -0.35
 	camera.rotation = Vector3(pitch, yaw, 0)
