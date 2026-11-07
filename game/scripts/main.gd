@@ -370,6 +370,9 @@ func _add_road(key: String, from: Vector3, to: Vector3, color: Color, flow: floa
 		roads[key]["end"] = to
 		roads[key]["flow"] = flow
 		return
+	var dist := Vector3(to.x - from.x, 0, to.z - from.z).length()
+	if dist < 4.0:
+		return  # degenerate road (start == end): look_at would fail, nothing to draw
 	var road := MeshInstance3D.new()
 	var rbm := BoxMesh.new()
 	road.mesh = rbm
@@ -378,7 +381,6 @@ func _add_road(key: String, from: Vector3, to: Vector3, color: Color, flow: floa
 	rmat.albedo_color = color
 	rmat.emission = color * 0.5
 	road.material_override = rmat
-	var dist := Vector3(to.x - from.x, 0, to.z - from.z).length()
 	road.position = (from + to) / 2.0 + Vector3(0, 1.5, 0)
 	road.scale = Vector3(2.0, 1.5, maxf(dist, 1.0))
 	world_root.add_child(road)
