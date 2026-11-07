@@ -39,12 +39,24 @@ is enforced daemon-side; everything else on your user account is fair game.
 
 1. **Sim** — fake process table, fully safe. *(planned)*
 2. **Live** — real PIDs, real signals, protected set, no file verbs. **← built**
+   Plus: **vaults** (enter mounts/dirs, hold-X erase guarded `rm -rf`) and
+   **SSH travel** (gateways from `~/.ssh/config` → remote worlds, remote
+   kill/rm via fixed verbs, remote file browsing with `V`).
 3. **YOLO** — root "Kernel Oracle" helper: `rm -rf`, `systemctl stop`,
    `rmmod`, everything. Requires sudo as the arming ritual and a btrfs
    snapshot (`snapper create`) to exist before arming. *(planned)*
 
 The Oracle will expose **verbs, never a shell** — path arguments, not command
 strings — so the privileged surface stays one small auditable binary.
+
+## Enemies
+
+The daemon spawns real CPU-burner + RAM-hoarder child processes (nice'd to
+19, TTL 180s, cap 4). They roam the plains as red ROGUE monoliths. Kill them
+with Shift+K before they expire or you "let one go free". Freezing one only
+buys 8 seconds — rogues break out of SIGSTOP. Because they wander among your
+real processes, an errant smite can kill something that matters. That's the
+game.
 
 ## Roadmap
 

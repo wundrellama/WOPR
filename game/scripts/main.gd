@@ -24,6 +24,8 @@ var pickables: Dictionary = {}   # StaticBody3D -> hover info dict
 var core_bodies: Array = []      # core index -> StaticBody3D
 var selected_pid: int = -1
 var last_action := ""
+var rogue_kills := 0
+var rogue_frees := 0  # rogues that expired on their own (you failed them)
 
 var camera: Camera3D
 var yaw := 0.0
@@ -43,13 +45,24 @@ var tower_bodies: Dictionary = {}  # ip -> StaticBody3D
 var world_root: Node3D
 var vault_root: Node3D
 var list_http: HTTPRequest
-var mode := "world"            # "world" | "vault"
+var mode := "world"            # "world" | "vault" | "remote"
 var vault_path := ""
 var vault_parent := ""
+var vault_host := ""           # "" = local machine
 var vault_bodies: Dictionary = {}  # StaticBody3D -> entry dict
 var erase_hold_start := -1.0       # msec when X was pressed, -1 = not held
 var hover_mount_path := ""         # vault path under crosshair in world mode
 const ERASE_HOLD_MS := 1000.0
+
+# --- ssh travel ---
+var remote_root: Node3D
+var remote_host := ""              # "" = home machine
+var ssh_gates: Dictionary = {}     # host -> StaticBody3D
+var hover_ssh_host := ""
+var remote_procs: Array = []
+var remote_monoliths: Dictionary = {}  # pid -> StaticBody3D on remote
+var remote_tick_timer: Timer
+var ssh_http: HTTPRequest
 
 func _ready() -> void:
 	world_http = HTTPRequest.new()
@@ -66,6 +79,16 @@ func _ready() -> void:
 	vault_root = Node3D.new()
 	vault_root.visible = false
 	add_child(vault_root)
+	remote_root = Node3D.new()
+	remote_root.visible = false
+	add_child(remote_root)
+	remote_tick_timer = Timer.new()
+	remote_tick_timer.wait_time = 5.0
+	add_child(remote_tick_timer)
+	remote_tick_timer.timeout.connect(_refresh_remote)
+	ssh_http = HTTPRequest.new()
+	add_child(ssh_http)
+	ssh_http.request_completed.connect(_on_ssh_world)
 	poll_timer = Timer.new()
 	poll_timer.wait_time = 1.0
 	add_child(poll_timer)
@@ -302,6 +325,54 @@ func _update_geo() -> void:
 			pickables.erase(tower_bodies[ip])
 			tower_bodies[ip].queue_free()
 			tower_bodies.erase(ip)
+	_update_ssh_gates()
+
+
+func _update_ssh_gates() -> void:
+	var ssh: Dictionary = world.get("ssh", {})
+	var hosts: Array = ssh.get("hosts", [])
+	var status: Dictionary = ssh.get("status", {})
+	var seen := {}
+	for i in hosts.size():
+		var h: String = hosts[i]
+		seen[h] = true
+		var st: String = str(status.get(h, "unknown"))
+		# gates stand in the harbor foreground, distinct from traffic towers
+		var ang := lerpf(deg_to_rad(-60.0), deg_to_rad(60.0),
+			i / maxf(float(hosts.size() - 1), 1.0))
+		var pos := Vector3(-260.0 + cos(ang) * 60.0, 0, sin(ang) * 160.0)
+		var color: Color
+		match st:
+			"open":
+				color = Color(0.2, 1.0, 0.6)
+			"unknown-hostkey":
+				color = Color(1.0, 0.7, 0.2)
+			_:
+				color = Color(0.4, 0.4, 0.45)
+		if not ssh_gates.has(h):
+			var gate := _add_box(Vector3(pos.x, 25, pos.z), Vector3(8, 50, 8),
+				color, {"kind": "ssh", "host": h, "status": st})
+			var tag := Label3D.new()
+			tag.text = "%s\n[%s]" % [h, st]
+			tag.font_size = 48
+			tag.pixel_size = 0.02
+			tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+			tag.modulate = color
+			tag.position = Vector3(pos.x, 62, pos.z)
+			world_root.add_child(tag)
+			ssh_gates[h] = [gate, tag]
+		else:
+			var pair: Array = ssh_gates[h]
+			var gmat: StandardMaterial3D = pair[0].get_child(0).material_override
+			gmat.emission = color * 0.5
+			pair[1].text = "%s\n[%s]" % [h, st]
+			pickables[pair[0]] = {"kind": "ssh", "host": h, "status": st}
+	for h in ssh_gates.keys():
+		if not seen.has(h):
+			pickables.erase(ssh_gates[h][0])
+			ssh_gates[h][0].queue_free()
+			ssh_gates[h][1].queue_free()
+			ssh_gates.erase(h)
 
 
 # ---------------------------------------------------------------- processes
@@ -310,6 +381,14 @@ func _district_pos(p: Dictionary) -> Vector3:
 	var pid: int = p["pid"]
 	var h1 := (pid * 2654435761) % 4093
 	var h2 := (pid * 40503) % 4099
+	if pid in world.get("enemies", []):
+		# rogues roam the plains: hash anchor + slow lissajous drift per tick
+		var t := float(world.get("tick", 0))
+		var ph := float(h1 % 628) / 100.0
+		var ax := float(h1 % 300) - 150.0
+		var az := float(h2 % 200) - 100.0
+		return Vector3(ax + sin(t * 0.35 + ph) * 90.0, 0,
+			az + cos(t * 0.27 + ph * 1.7) * 70.0)
 	if pid == 1:
 		return Vector3.ZERO
 	if p["ppid"] == 2 or (p["ppid"] == 1 and str(p["name"]).begins_with("[")):
@@ -388,6 +467,8 @@ func _sync_procs() -> void:
 ## Kernel spirits are born of kthreadd (pid 2).
 func _species(p: Dictionary) -> Dictionary:
 	var pid: int = p["pid"]
+	if pid in world.get("enemies", []):
+		return {"name": "ROGUE", "color": Color(1.0, 0.1, 0.1)}
 	if pid == 0:
 		return {"name": "The Void", "color": Color(0.5, 0.0, 0.6)}
 	if pid == 1:
@@ -425,12 +506,16 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_ESCAPE:
 				if mode == "vault":
 					_vault_leave()
+				elif mode == "remote":
+					_return_home()
 				else:
 					get_tree().quit()
 			KEY_ENTER, KEY_KP_ENTER:
 				if mode == "vault":
 					_vault_open_hovered()
-				elif hover_mount_path != "":
+				elif mode == "world" and hover_ssh_host != "":
+					_travel_to(hover_ssh_host)
+				elif mode == "world" and hover_mount_path != "":
 					_enter_vault(hover_mount_path)
 			KEY_BACKSPACE:
 				if mode == "vault":
@@ -439,14 +524,17 @@ func _unhandled_input(event: InputEvent) -> void:
 					else:
 						_vault_leave()
 			KEY_F:
-				if mode == "world":
+				if mode != "vault":
 					_act(19)   # SIGSTOP
 			KEY_C:
-				if mode == "world":
+				if mode != "vault":
 					_act(18)   # SIGCONT
 			KEY_K:
-				if mode == "world" and event.shift_pressed:
+				if mode != "vault" and event.shift_pressed:
 					_act(9)  # SIGKILL
+			KEY_V:
+				if mode == "remote" and remote_host != "":
+					_enter_vault("~", remote_host)
 
 
 func _process(delta: float) -> void:
@@ -474,6 +562,8 @@ func _process(delta: float) -> void:
 				_vault_erase()
 		else:
 			erase_hold_start = -1.0
+	elif mode == "remote":
+		_update_remote_hover()
 	else:
 		_update_hover()
 	# living world breathes; frozen ones don't
@@ -508,6 +598,7 @@ func _hover_ray() -> Dictionary:
 func _update_hover() -> void:
 	hover_pid = -1
 	hover_mount_path = ""
+	hover_ssh_host = ""
 	var hit := _hover_ray()
 	if hit.is_empty():
 		hover_label.text = ""
@@ -551,6 +642,19 @@ func _update_hover() -> void:
 			var t: float = float(hw.get("temps", {}).get("amdgpu", 0.0))
 			hover_label.add_theme_color_override("font_color", Color(1.0, 0.5, 0.2))
 			hover_label.text = "GPU FORGE  ·  %d%% busy  ·  %.0f°C" % [gpu, t]
+		"ssh":
+			hover_ssh_host = str(info["host"])
+			var st: String = str(info["status"])
+			var col := Color(0.4, 0.4, 0.45)
+			var hint := "SEALED"
+			if st == "open":
+				col = Color(0.2, 1.0, 0.6)
+				hint = "Enter: TRAVEL"
+			elif st == "unknown-hostkey":
+				col = Color(1.0, 0.7, 0.2)
+				hint = "host key unconfirmed — run ssh once"
+			hover_label.add_theme_color_override("font_color", col)
+			hover_label.text = "GATEWAY '%s'  ·  %s  ·  %s" % [hover_ssh_host, st, hint]
 
 
 func _pick() -> void:
@@ -563,10 +667,161 @@ func _pick() -> void:
 		selected_pid = hover_pid
 
 
-# ---------------------------------------------------------------- vaults
+# ---------------------------------------------------------------- ssh travel
 
-func _enter_vault(path: String) -> void:
-	list_http.request(API + "/list?path=" + path.uri_encode())
+func _travel_to(host: String) -> void:
+	ssh_http.request(API + "/ssh/world?host=" + host.uri_encode())
+	last_action = "traveling to %s..." % host
+
+
+func _on_ssh_world(_result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	var parsed = JSON.parse_string(body.get_string_from_utf8())
+	if typeof(parsed) != TYPE_DICTIONARY:
+		last_action = "travel failed"
+		return
+	if parsed.has("error"):
+		last_action = "travel refused: " + str(parsed["error"])
+		return
+	remote_host = str(parsed["host"])
+	var host_changed := mode != "remote"
+	mode = "remote"
+	world_root.visible = false
+	vault_root.visible = false
+	remote_root.visible = true
+	remote_tick_timer.start()
+	if host_changed:
+		camera.position = Vector3(0, 120, 520)
+		yaw = 0.0
+		pitch = -0.35
+		camera.rotation = Vector3(pitch, yaw, 0)
+	_render_remote(parsed)
+	last_action = "arrived at " + remote_host
+
+
+func _refresh_remote() -> void:
+	if mode == "remote" and remote_host != "":
+		ssh_http.request(API + "/ssh/world?host=" + remote_host.uri_encode())
+
+
+func _render_remote(parsed: Dictionary) -> void:
+	for c in remote_root.get_children():
+		c.queue_free()
+	remote_procs = parsed.get("procs", [])
+	var fm := MeshInstance3D.new()
+	var pm := PlaneMesh.new()
+	pm.size = Vector2(2000, 2000)
+	var fmat := StandardMaterial3D.new()
+	fmat.albedo_color = Color(0.03, 0.06, 0.05)
+	fmat.emission_enabled = true
+	fmat.emission = Color(0.01, 0.04, 0.03)
+	fm.material_override = fmat
+	fm.mesh = pm
+	remote_root.add_child(fm)
+	var mem_pct: float = float(parsed.get("mem", {}).get("percent", 0))
+	var title := Label3D.new()
+	title.text = "%s   load %s   mem %.0f%%" % [remote_host,
+		" ".join(PackedStringArray(parsed.get("load", []))), mem_pct]
+	title.font_size = 96
+	title.pixel_size = 0.02
+	title.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	title.modulate = Color(0.4, 1.0, 0.7)
+	title.position = Vector3(0, 130, 0)
+	remote_root.add_child(title)
+	remote_monoliths.clear()
+	for p in remote_procs:
+		var pid: int = int(p["pid"])
+		var mem_mb: float = float(p["mem_rss"]) / 1048576.0
+		var height: float = clampf(2.0 + log(maxf(mem_mb, 1.0)) * 3.0, 2.0, 90.0)
+		var h1 := (pid * 2654435761) % 4093
+		var h2 := (pid * 40503) % 4099
+		var pos: Vector3
+		if pid == 1:
+			pos = Vector3.ZERO
+		elif int(p["ppid"]) == 2 or (int(p["ppid"]) == 1 and str(p["name"]).begins_with("[")):
+			var ang := lerpf(0, TAU, float(h1 % 1000) / 1000.0)
+			var rad := 110.0 + float(h2 % 100) * 0.6
+			pos = Vector3(cos(ang) * rad, 0, sin(ang) * rad)
+		else:
+			pos = Vector3(float(h1 % 500) - 250.0, 0, 160.0 + float(h2 % 300))
+		var body := StaticBody3D.new()
+		var m := MeshInstance3D.new()
+		var bm := BoxMesh.new()
+		bm.size = Vector3(6, height, 6)
+		m.mesh = bm
+		var mat := StandardMaterial3D.new()
+		mat.emission_enabled = true
+		var color := Color(0.4, 1.0, 0.7)  # remote kin are jade
+		if pid == 1:
+			color = Color(1.0, 0.85, 0.0)
+		elif str(p["user"]) == "root":
+			color = Color(0.2, 0.75, 0.45)
+		elif str(p["state"]) == "T":
+			color = Color(0.25, 0.28, 0.32)
+		mat.albedo_color = color
+		mat.emission = color * (0.15 + clampf(float(p["cpu"]) / 100.0, 0.0, 0.65))
+		m.material_override = mat
+		body.add_child(m)
+		var cs := CollisionShape3D.new()
+		var shape := BoxShape3D.new()
+		shape.size = Vector3(6, height, 6)
+		cs.shape = shape
+		body.add_child(cs)
+		body.position = Vector3(pos.x, height / 2.0, pos.z)
+		remote_root.add_child(body)
+		remote_monoliths[pid] = body
+
+
+func _return_home() -> void:
+	mode = "world"
+	remote_host = ""
+	remote_tick_timer.stop()
+	world_root.visible = true
+	remote_root.visible = false
+	camera.position = Vector3(0, 120, 520)
+	yaw = 0.0
+	pitch = -0.35
+	camera.rotation = Vector3(pitch, yaw, 0)
+	last_action = "returned home"
+
+
+func _remote_proc(pid: int):
+	for p in remote_procs:
+		if int(p["pid"]) == pid:
+			return p
+	return null
+
+
+func _update_remote_hover() -> void:
+	hover_pid = -1
+	var space := camera.get_world_3d().direct_space_state
+	var query := PhysicsRayQueryParameters3D.create(
+		camera.global_position,
+		camera.global_position + camera.global_transform.basis.z * -1500.0)
+	var hit := space.intersect_ray(query)
+	if hit.is_empty() or not hit.has("collider"):
+		hover_label.text = "REMOTE: %s — F/C/Shift+K act on this machine · Esc: return home" % remote_host
+		return
+	for pid in remote_monoliths:
+		if remote_monoliths[pid] == hit["collider"]:
+			hover_pid = pid
+			break
+	var p = null
+	if hover_pid >= 0:
+		p = _remote_proc(hover_pid)
+	if p == null:
+		hover_label.text = "REMOTE: %s — F/C/Shift+K act on this machine · Esc: return home" % remote_host
+		return
+	hover_label.add_theme_color_override("font_color", Color(0.4, 1.0, 0.7))
+	hover_label.text = "%s @ %s  ·  pid %d '%s'  ·  %s  ·  cpu %s%%  ·  %dMB  ·  %s" % [
+		_species(p)["name"], remote_host, p["pid"], p["name"], p["state"],
+		p["cpu"], int(float(p["mem_rss"]) / 1048576.0), p["user"]]
+
+func _enter_vault(path: String, host: String = "") -> void:
+	vault_host = host
+	if host != "":
+		list_http.request(API + "/ssh/list?host=" + host.uri_encode() + "&path=" + path.uri_encode())
+	else:
+		list_http.request(API + "/list?path=" + path.uri_encode())
 
 
 func _on_listing(_result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
@@ -576,6 +831,7 @@ func _on_listing(_result: int, code: int, _headers: PackedStringArray, body: Pac
 		return
 	mode = "vault"
 	world_root.visible = false
+	remote_root.visible = false
 	vault_root.visible = true
 	vault_path = parsed["path"]
 	vault_parent = parsed["parent"]
@@ -694,6 +950,18 @@ func _vault_open_hovered() -> void:
 
 
 func _vault_leave() -> void:
+	if vault_host != "":
+		# came from a remote machine — go back to its world, not home
+		mode = "remote"
+		vault_host = ""
+		vault_root.visible = false
+		remote_root.visible = true
+		camera.position = Vector3(0, 120, 520)
+		yaw = 0.0
+		pitch = -0.35
+		camera.rotation = Vector3(pitch, yaw, 0)
+		last_action = "left remote vault"
+		return
 	mode = "world"
 	world_root.visible = true
 	vault_root.visible = false
@@ -712,7 +980,10 @@ func _vault_erase() -> void:
 		return
 	var e: Dictionary = hit["entry"]
 	var full := vault_path.rstrip("/") + "/" + str(e["name"])
-	var body := JSON.stringify({"verb": "rm", "path": full, "confirm": true})
+	var payload := {"verb": "rm", "path": full, "confirm": true}
+	if vault_host != "":
+		payload["host"] = vault_host
+	var body := JSON.stringify(payload)
 	action_http.request(API + "/action", [], HTTPClient.METHOD_POST, body)
 	last_action = "erasing %s..." % full
 
@@ -721,7 +992,10 @@ func _act(sig: int) -> void:
 	if selected_pid < 0:
 		last_action = "no target — aim at a process monolith"
 		return
-	var body := JSON.stringify({"verb": "kill", "pid": selected_pid, "sig": sig})
+	var payload := {"verb": "kill", "pid": selected_pid, "sig": sig}
+	if mode == "remote" and remote_host != "":
+		payload["host"] = remote_host
+	var body := JSON.stringify(payload)
 	action_http.request(API + "/action", [], HTTPClient.METHOD_POST, body)
 	last_action = "casting kill(%d, %d)..." % [selected_pid, sig]
 
@@ -733,12 +1007,14 @@ func _on_action(_result: int, _code: int, _headers: PackedStringArray, body: Pac
 	else:
 		last_action = "REFUSED: " + str(resp.get("error", "unknown"))
 
-
 # ---------------------------------------------------------------- hud
 
 func _update_hud() -> void:
 	if world.is_empty():
 		hud.text = "waiting for frameshiftd... (python3 telemetry/frameshiftd.py)"
+		return
+	if mode == "remote":
+		hud.text = "REMOTE WORLD: %s\nF freeze · C resume · Shift+K smite — REAL remote syscalls via ssh · V: browse remote files\nEsc: return home\nlast: %s" % [remote_host, last_action]
 		return
 	var cpu: Dictionary = world["cpu"]
 	var mem: Dictionary = world["mem"]

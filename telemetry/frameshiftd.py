@@ -28,9 +28,12 @@ World schema (v0):
   }
 """
 import json
+import atexit
 import os
+import random
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -44,6 +47,79 @@ except ImportError:
 
 PORT = int(os.environ.get("FRAMESHIFT_PORT", "8765"))
 TICK = float(os.environ.get("FRAMESHIFT_TICK", "1.0"))
+
+# --- enemies: real CPU-burner child processes the player must hunt ---
+ENEMY_CAP = int(os.environ.get("FRAMESHIFT_ENEMIES", "4"))
+ENEMY_TTL = float(os.environ.get("FRAMESHIFT_ENEMY_TTL", "180"))
+ENEMY_SPAWN_SECS = float(os.environ.get("FRAMESHIFT_ENEMY_SPAWN", "20"))
+ENEMY_FREEZE_ESCAPE = 8.0
+ENEMIES = {}  # pid -> {"proc": Popen, "spawned": t, "frozen_since": float|None}
+_last_spawn = [0.0]
+
+_BURN = (
+    "import time,sys,random\n"
+    "end=time.time()+float(sys.argv[1])\n"
+    "target=int(sys.argv[2])\n"
+    "hog=[]\n"
+    "got=0\n"
+    "while got<target:\n"
+    "    try:\n"
+    "        hog.append(bytearray(16*1024*1024)); got+=16*1024*1024\n"
+    "    except MemoryError:\n"
+    "        break\n"
+    "while time.time()<end:\n"
+    "    pass\n"
+)
+
+
+def _spawn_enemy():
+    # each rogue burns one core AND hoards 100-600 MB of real RAM
+    hog_mb = random.randint(100, 600)
+    p = subprocess.Popen(
+        [sys.executable, "-c", _BURN, str(ENEMY_TTL), str(hog_mb * 1024 * 1024)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        preexec_fn=lambda: os.nice(19),
+    )
+    ENEMIES[p.pid] = {"proc": p, "spawned": time.time(), "frozen_since": None}
+    return p.pid
+
+
+def _kill_all_enemies():
+    for pid, e in list(ENEMIES.items()):
+        try:
+            e["proc"].kill()
+        except OSError:
+            pass
+    ENEMIES.clear()
+
+
+def _tend_enemies():
+    """Reap dead, punish freezes, keep the world at population."""
+    now = time.time()
+    for pid in list(ENEMIES.keys()):
+        e = ENEMIES[pid]
+        if e["proc"].poll() is not None:
+            del ENEMIES[pid]
+            continue
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                state = f.read().rsplit(b")", 1)[1].split()[0]
+        except OSError:
+            state = b"?"
+        if state == b"T":
+            if e["frozen_since"] is None:
+                e["frozen_since"] = now
+            elif now - e["frozen_since"] > ENEMY_FREEZE_ESCAPE:
+                os.kill(pid, 18)  # SIGCONT — rogues break free
+                e["frozen_since"] = None
+        else:
+            e["frozen_since"] = None
+    if len(ENEMIES) < ENEMY_CAP and now - _last_spawn[0] > ENEMY_SPAWN_SECS:
+        _last_spawn[0] = now
+        try:
+            _spawn_enemy()
+        except OSError:
+            pass
 
 _prev_disk = {"t": None, "read": 0, "write": 0}
 
@@ -179,6 +255,168 @@ def gather_hardware():
     return {"mounts": mounts, "gpu_busy": gpu_busy, "temps": temps}
 
 
+def ssh_hosts() -> list:
+    """Hosts from ~/.ssh/config (no wildcards). The travel network."""
+    path = os.path.expanduser("~/.ssh/config")
+    hosts = []
+    try:
+        with open(path) as f:
+            for line in f:
+                s = line.strip()
+                if s.lower().startswith("host ") and "*" not in s:
+                    for tok in s.split()[1:]:
+                        if "*" not in tok and tok not in hosts:
+                            hosts.append(tok)
+    except OSError:
+        pass
+    return hosts
+
+
+_ssh_probe_cache = {"t": 0.0, "status": {}, "refreshing": False}
+
+
+def _ssh_run(host: str, cmd: str, timeout: float = 8.0):
+    """Fixed-verb ssh runner. BatchMode: never prompts, never hangs."""
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+             host, cmd],
+            capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except OSError as e:
+        return 125, "", str(e)
+
+
+def _ssh_probe_refresh():
+    status = {}
+    for h in ssh_hosts():
+        rc, out, err = _ssh_run(h, "echo ok", timeout=7)
+        if rc == 0:
+            status[h] = "open"
+        elif "host key verification failed" in err.lower():
+            status[h] = "unknown-hostkey"
+        else:
+            status[h] = "closed"
+    _ssh_probe_cache.update(t=time.time(), status=status, refreshing=False)
+
+
+def ssh_probe_status() -> dict:
+    """Cached reachability per host; refresh runs off-thread so the world
+    tick never blocks on ssh timeouts."""
+    c = _ssh_probe_cache
+    if not c["refreshing"] and time.time() - c["t"] > 30:
+        c["refreshing"] = True
+        threading.Thread(target=_ssh_probe_refresh, daemon=True).start()
+    return c["status"]
+
+
+_REMOTE_WORLD = (
+    "echo '@@LOAD '$(cat /proc/loadavg); "
+    "echo '@@MEM '$(grep -E '^(MemTotal|MemAvailable)' /proc/meminfo | awk '{printf \"%s \", $2}'); "
+    "echo '@@HOST '$(hostname); "
+    "ps -eo pid,ppid,user,comm,rss,pcpu,state --no-headers 2>/dev/null | head -400"
+)
+
+
+def remote_world(host: str) -> dict:
+    rc, out, err = _ssh_run(host, _REMOTE_WORLD)
+    if rc != 0:
+        return {"error": err or f"ssh exit {rc}"}
+    procs, load, mem, rhost = [], [0, 0, 0], (0, 0), host
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("@@LOAD "):
+            load = line[7:].split()[:3]
+        elif line.startswith("@@MEM "):
+            parts = line[6:].split()
+            if len(parts) >= 2:
+                mem = (int(parts[0]) * 1024, int(parts[1]) * 1024)
+        elif line.startswith("@@HOST "):
+            rhost = line[7:]
+        elif line:
+            cols = line.split(None, 6)
+            if len(cols) >= 7:
+                try:
+                    procs.append({
+                        "pid": int(cols[0]), "ppid": int(cols[1]),
+                        "user": cols[2], "name": cols[3],
+                        "mem_rss": int(cols[4]) * 1024,
+                        "cpu": float(cols[5]), "state": cols[6],
+                    })
+                except ValueError:
+                    continue
+    total, avail = mem
+    return {
+        "host": rhost, "load": load,
+        "mem": {"total": total, "available": avail,
+                "percent": round(100.0 * (total - avail) / max(total, 1), 1)},
+        "procs": procs,
+    }
+
+
+_REMOTE_LIST_TMPL = (
+    "cd -- {path} 2>/dev/null || {{ echo CDD_FAIL; exit 0; }}; "
+    "find . -maxdepth 1 -mindepth 1 -printf '%y %s %T@ %f\\n' 2>/dev/null | head -400"
+)
+
+
+def remote_list(host: str, path: str) -> dict:
+    import shlex
+    # let the REMOTE shell expand ~ (remote user may differ from local)
+    if path in ("~", ""):
+        qpath = "$HOME"
+    elif path.startswith("~/"):
+        qpath = '"$HOME"/' + shlex.quote(path[2:])
+    else:
+        qpath = shlex.quote(path)
+    rc, out, err = _ssh_run(host, _REMOTE_LIST_TMPL.format(path=qpath))
+    if rc != 0:
+        return {"error": err or f"ssh exit {rc}"}
+    if "CDD_FAIL" in out:
+        return {"error": "no such directory"}
+    entries = []
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        typ, size, mtime, name = parts
+        entries.append({
+            "name": name, "dir": typ == "d",
+            "size": int(float(size)), "mtime": float(mtime),
+        })
+    entries.sort(key=lambda x: (not x["dir"], -x["size"]))
+    parent = os.path.dirname(path.rstrip("/")) or "/"
+    return {"path": path, "parent": parent, "entries": entries, "truncated": False}
+
+
+def remote_action(host: str, req: dict) -> dict:
+    """Fixed verbs only: kill(pid,sig) and rm(path) on the remote."""
+    import shlex
+    verb = req.get("verb")
+    if verb == "kill":
+        pid, sig = int(req.get("pid", -1)), int(req.get("sig", 0))
+        if sig not in (19, 18, 9) or pid < 1:
+            return {"ok": False, "error": "bad kill args"}
+        rc, out, err = _ssh_run(host, f"kill -{sig} {pid} 2>&1; echo RC:$?")
+        ok = "RC:0" in out
+        return {"ok": ok, "syscall": f"ssh {host} kill({pid},{sig})",
+                "error": None if ok else (out + err).replace("RC:1", "").strip()}
+    if verb == "rm":
+        if not req.get("confirm"):
+            return {"ok": False, "error": "rm requires confirm"}
+        path = str(req.get("path", ""))
+        if path in ("", "/", "~", ".", ".."):
+            return {"ok": False, "error": "refused"}
+        rc, out, err = _ssh_run(
+            host, f"rm -rf -- {shlex.quote(path)} 2>&1; echo RC:$?")
+        ok = "RC:0" in out
+        return {"ok": ok, "syscall": f"ssh {host} rm -rf {path}",
+                "error": None if ok else (out + err).replace("RC:1", "").strip()}
+    return {"ok": False, "error": "unknown remote verb"}
+
+
 def gather_listing(path: str) -> dict:
     """Directory contents for vault interiors. Dir sizes use a capped walk."""
     path = os.path.realpath(path)
@@ -277,6 +515,8 @@ def gather_world(tick: int) -> dict:
         "hw": gather_hardware(),
         "procs": gather_processes(),
         "net": gather_net(),
+        "enemies": sorted(ENEMIES.keys()),
+        "ssh": {"hosts": ssh_hosts(), "status": ssh_probe_status()},
     }
 
 
@@ -309,7 +549,10 @@ class _Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length", 0))
             req = json.loads(self.rfile.read(n))
             verb = req.get("verb")
-            if verb == "rm":
+            host = req.get("host")
+            if host:
+                body = json.dumps(remote_action(str(host), req)).encode()
+            elif verb == "rm":
                 body = self._do_rm(req)
             else:
                 body = self._do_kill(req)
@@ -360,28 +603,37 @@ class _Handler(BaseHTTPRequestHandler):
         return json.dumps({"ok": True, "syscall": verb_txt, "path": path}).encode()
 
     def do_GET(self):
-        if self.path.startswith("/list"):
+        parsed_url = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed_url.query)
+        if parsed_url.path == "/ssh/world":
+            host = qs.get("host", [""])[0]
+            body = json.dumps(remote_world(host) if host else {"error": "no host"}).encode()
+            self._json(body)
+        elif parsed_url.path == "/ssh/list":
+            host = qs.get("host", [""])[0]
+            path = qs.get("path", ["~"])[0]
+            body = json.dumps(remote_list(host, path) if host else {"error": "no host"}).encode()
+            self._json(body)
+        elif parsed_url.path.startswith("/list"):
             try:
-                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 path = qs.get("path", [os.path.expanduser("~")])[0]
                 body = json.dumps(gather_listing(path)).encode()
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._json(body)
         elif self.path in ("/world.json", "/health"):
             body = self.blob if self.blob else b'{"error":"no snapshot yet"}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+            self._json(body)
         else:
             self.send_error(404)
+
+    def _json(self, body: bytes):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, *args):
         pass  # quiet
@@ -400,11 +652,13 @@ def main():
 
 
 def _poller():
+    atexit.register(_kill_all_enemies)
     tick = 0
     while True:
         t0 = time.time()
         tick += 1
         try:
+            _tend_enemies()
             _Handler.blob = json.dumps(
                 gather_world(tick), separators=(",", ":")
             ).encode()
