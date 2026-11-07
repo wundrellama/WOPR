@@ -53,4 +53,5 @@ smite_proc={
 
 [rendering]
 
-environment/defaults/default_clear_color=Color(0.02, 0.03, 0.06, 1)
+anti_aliasing/quality/msaa_3d=2
+environment/defaults/default_clear_color=Color(0.005, 0.012, 0.022, 1)

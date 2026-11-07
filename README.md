@@ -29,6 +29,20 @@ Play it on a machine you can afford to lose, or with backups you can afford to
 lose the machine for. That tension — a beautiful world you are *allowed* to
 ruin — is the entire point of the game.
 
+## Screenshots
+
+Captured from the real Godot renderer using **explicitly synthetic, offline test
+fixtures**. The telemetry, PIDs, hosts, paths and signal replies shown here are
+not live machine data; the captures execute no real system actions.
+
+| Opening console | Live-world presentation |
+| --- | --- |
+| ![WOPR opening console](docs/screenshots/opening.png) | ![Fixture process city and telemetry HUD](docs/screenshots/world.png) |
+| File-vault interior | SSH link transition |
+| ![Isolated amber file vault](docs/screenshots/vault.png) | ![Cyan SSH tunnel awaiting a remote snapshot](docs/screenshots/ssh-transit.png) |
+
+![Signal acknowledgement pulse and returned daemon-result panel, using an offline fixture](docs/screenshots/signal-confirmed.png)
+
 ## Layout
 
 - `telemetry/frameshiftd.py` — world-state daemon (psutil). Serves
@@ -49,6 +63,77 @@ otherwise it spawns its own as a child with a parent-death watchdog. Either
 way, **quitting the game stops everything** — recording, enemies, the Oracle.
 To run the daemon separately (e.g. for remote-host enemy hunting before you
 launch the game): `python3 telemetry/frameshiftd.py`.
+
+## Visual presentation
+
+The native Godot presentation follows a **WarGames command console / submerged
+circuit city** direction: dark architectural surfaces with luminous edge and
+circuit detail, raised CPU islands, orbital kernel rings, an industrial GPU
+reactor, and a quieter translucent memory tide. Process height still follows RAM
+on a logarithmic scale; PID 1 is the taller capital landmark. CPU activity drives
+the signal lighting, frozen processes stay grey, and locked targets get an amber
+flight-instrument bracket.
+
+The monospace HUD separates telemetry, target details, navigation, and commands.
+LIVE, safe SIM replay, remote-machine actions, and ROOT ARMED states remain
+explicit. Opening, exit, and Oracle screens share the same visual language.
+Fonts use system monospace fallbacks; no downloads or external assets are needed.
+The default renderer remains Forward+, with 4× MSAA; the art also works with
+Godot's Compatibility renderer.
+
+### Travel and signal feedback
+
+Entering a file vault plays an amber descent; SSH travel uses a cyan tunnel/link
+sequence. The scene stays covered and actions stay suspended while the real
+snapshot/listing is pending. A valid reply materializes the destination with a
+short camera/geometry arrival. Refusal, cancellation, or timeout preserves the
+original world. **Esc cancels a pending journey.** Held action keys must be
+released after arrival; stale responses cannot switch to an old destination.
+Remote subdirectory and parent navigation keep the same SSH host.
+
+Outdoor terrain and memory water belong only to the local world. Separate
+raycast layers isolate local processes, remote processes, and vault entries, so
+hidden-world colliders cannot intercept targeting. Vault/remote titles use
+readable world-space sizes; the vault's HUD index describes its directory rather
+than unrelated outdoor districts.
+
+Target lock emits a cyan pulse. **F** fires an ice-blue freeze beam, **C** a jade
+resume beam, and **K** a coral/amber smite shot. Beams terminate at the real
+camera-facing pick surface. Shots are labelled **awaiting daemon** until their
+response arrives: green pulses mean acknowledged success, red pulses and the
+result panel show refusal/failure. A missing or invalid reply is **unconfirmed**,
+not evidence that a syscall did or did not occur. No visual effect executes an
+action on its own, and a pending shot cannot be redirected by travel or a second
+shot. Armed local smite still uses the Oracle; remote smite still targets the
+acknowledged remote host.
+
+### Safe visual verification
+
+**Do not launch the real game just to test a shader.** The isolated test subclass
+never starts/adopts/stops a daemon, disables gameplay input, and supplies labelled
+synthetic fixtures instead of contacting the API:
+
+```sh
+python3 game/tests/verify_visuals.py
+# Optional: real shader rendering and screenshots on an isolated X server.
+# Requires xvfb-run; screenshots cover 1600×900 and 1152×648.
+python3 game/tests/verify_visuals.py --render --output "$TMPDIR/wopr-visual-tests"
+```
+
+This covers title, world, target lock, remote world, vault, SIM, ROOT ARMED,
+Oracle ritual, and farewell. Regression tests exercise hidden-world picking,
+readable titles, arrival/return, refusal/timeout/cancellation/stale replies,
+remote path context, held-key gating, signal payloads and acknowledgements,
+root-versus-remote routing, malformed responses, surface impacts, and effect
+cleanup. Tests replace the transport boundary with offline fixture replies;
+HTTP clients must remain disconnected. The render option additionally compiles
+the shaders, saves both-size screen captures, and records vault/SSH/shot frame
+sequences. It does **not** exercise real signals, file deletion, SSH, or sudo.
+
+Presentation code: `game/scripts/console_ui.gd`, `flight_overlay.gd`,
+`travel_overlay.gd`, `action_effects.gd`, `world_art.gd`, and `game/shaders/`.
+Navigation and action orchestration remain in `main.gd`; telemetry and
+privileged daemon code are unchanged.
 
 ## Controls
 

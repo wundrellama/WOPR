@@ -19,8 +19,11 @@ float grid_line(float coord, float width) {
 }
 
 void fragment() {
-	float minor = max(grid_line(world_xz.x, 1.2), grid_line(world_xz.y, 1.2));
-	float major = max(grid_line(world_xz.x, 2.6), grid_line(world_xz.y, 2.6));
+	// Derivative-aware lines stay fine rather than shimmering at a distance.
+	vec2 footprint = max(fwidth(world_xz), vec2(0.35));
+	float minor = max(grid_line(world_xz.x, footprint.x), grid_line(world_xz.y, footprint.y));
+	float fine_fade = 1.0 - smoothstep(1.0, 12.0, max(footprint.x, footprint.y));
+	minor *= fine_fade;
 	// major lines every 10 cells
 	float f10x = abs(fract(world_xz.x / (cell_size * 10.0) - 0.5) - 0.5) * cell_size * 10.0;
 	float f10y = abs(fract(world_xz.y / (cell_size * 10.0) - 0.5) - 0.5) * cell_size * 10.0;
@@ -29,9 +32,11 @@ void fragment() {
 	float pulse = 0.75 + 0.25 * sin(TIME * pulse_speed + (world_xz.x + world_xz.y) * 0.004);
 
 	vec3 col = plate_color.rgb;
-	col += seam_color.rgb * minor * 0.55 * pulse;
-	col += major_color.rgb * major * 0.5 * pulse;
-	col += major_color.rgb * major10 * 1.2;
+	col += seam_color.rgb * minor * 0.18 * pulse;
+	col += major_color.rgb * major10 * 0.4;
+	// A slow radial sweep reads as a diagnostic pulse, not a disco floor.
+	float sweep = pow(max(0.0, sin(length(world_xz) * 0.014 - TIME * 0.4)), 48.0);
+	col += seam_color.rgb * sweep * minor * 0.1;
 
 	float dist = length(world_xz) / 2600.0;
 	col *= 1.0 - clamp(dist, 0.0, 0.85);  // fade to void at the horizon
