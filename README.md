@@ -6,6 +6,11 @@ An open world exploration game where the world is the virtual insides of the
 actual machine running the game. Every monolith is a real process. Every spell
 is a real syscall. "Shall we play a game?"
 
+> **Linux required.** Native macOS and Windows are not supported.
+> Godot is cross-platform, but WOPR's system backend currently requires Linux.
+> On a Mac, use a Linux virtual machine. The local game world then represents
+> the Linux guest, not macOS.
+
 ## ⚠️ THIS GAME CAN DESTROY YOUR SYSTEM
 
 This is not a simulation and there is no sandbox. Every verb is a real syscall
@@ -58,8 +63,11 @@ not live machine data; the captures execute no real system actions.
 
 ## Run it
 
+Download or clone this repository first. Install Godot 4.7 and Python 3 with
+`psutil`. Run this command from the repository's top-level folder:
+
 ```sh
-godot --path game/                      # that's it
+godot --path game/
 ```
 
 The game adopts a running `frameshiftd` if one answers on `127.0.0.1:8765`,
